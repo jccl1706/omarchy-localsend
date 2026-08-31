@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jccl1706.localsend",
+  "name": "LocalSend",
+  "version": "1.0.0",
+  "author": "jc",
+  "license": "MIT",
+  "description": "Send and receive files over the LAN via LocalSend, right from the Omarchy bar",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "LocalSend",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
