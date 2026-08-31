@@ -10,7 +10,7 @@ Omarchy shell bar-widget plugin that integrates [LocalSend](https://localsend.or
 ## Install
 
 ```bash
-omarchy plugin add <git-url-once-published> --enable --yes
+omarchy plugin add https://github.com/jccl1706/omarchy-localsend.git --enable --yes
 ```
 
 Or by hand:
