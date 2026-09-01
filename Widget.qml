@@ -25,14 +25,55 @@ BarWidget {
   readonly property string deviceAlias: parseToml(configFile.text(), "alias", hostnameFile.text().trim() || "This device")
   readonly property string port: parseToml(configFile.text(), "port", "53317")
   readonly property string destination: parseToml(configFile.text(), "destination", "~/Downloads")
+  readonly property string destinationDir: destination.indexOf("~") === 0
+    ? Quickshell.env("HOME") + destination.substring(1)
+    : destination
 
   readonly property bool opened: popup.open
+  property var recentFiles: []
+  property bool hasNewFile: false
 
   function parseToml(text, key, fallback) {
     if (!text) return fallback
     var re = new RegExp("^\\s*" + key + "\\s*=\\s*\"?([^\"\\n]*?)\"?\\s*$", "m")
     var match = re.exec(text)
     return match && match[1].length > 0 ? match[1] : fallback
+  }
+
+  function updateRecentFiles(text) {
+    var lines = String(text || "").split("\n").filter(function(l) { return l.length > 0 })
+    var files = []
+    for (var i = 0; i < lines.length; i++) {
+      var tab = lines[i].indexOf("\t")
+      if (tab === -1) continue
+      var epoch = parseFloat(lines[i].substring(0, tab))
+      var name = lines[i].substring(tab + 1)
+      if (!isFinite(epoch) || name.length === 0) continue
+      files.push({ name: name, mtime: epoch })
+    }
+    root.recentFiles = files
+  }
+
+  function refreshRecentFiles() {
+    if (!recentFilesProc.running) recentFilesProc.running = true
+  }
+
+  function notifyReceived(filename) {
+    if (!bar) return
+    bar.run("notify-send " + Util.shellQuote("LocalSend") + " " + Util.shellQuote("Received " + filename) + " -i localsend")
+  }
+
+  onDestinationDirChanged: {
+    receiveWatcher.running = false
+    receiveWatcherRestart.restart()
+    refreshRecentFiles()
+  }
+
+  onOpenedChanged: if (opened) { hasNewFile = false; refreshRecentFiles() }
+
+  Component.onCompleted: {
+    receiveWatcher.running = true
+    refreshRecentFiles()
   }
 
   function urlToPath(url) {
@@ -72,6 +113,36 @@ BarWidget {
     printErrors: false
   }
 
+  Process {
+    id: recentFilesProc
+    command: ["bash", "-c", "find " + Util.shellQuote(root.destinationDir) + " -maxdepth 1 -type f -printf '%T@\\t%f\\n' 2>/dev/null | sort -rn | head -5"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateRecentFiles(text) }
+  }
+
+  // Watches the destination folder for completed transfers so the popup can
+  // show recent arrivals and the bar icon can flag unseen ones — all from
+  // local filesystem events, since localsend-cli exposes no API of its own
+  // to poll for this. Restarts on exit (e.g. destination folder not created
+  // yet) the same way PluginRegistry's own plugin-folder watcher does.
+  Process {
+    id: receiveWatcher
+    command: ["inotifywait", "-m", "-q", "-e", "close_write,moved_to", "--format", "%f", root.destinationDir]
+    stdout: SplitParser {
+      onRead: function(filename) {
+        root.refreshRecentFiles()
+        if (!root.opened) root.hasNewFile = true
+        root.notifyReceived(filename)
+      }
+    }
+    onExited: receiveWatcherRestart.restart()
+  }
+
+  Timer {
+    id: receiveWatcherRestart
+    interval: 5000
+    onTriggered: receiveWatcher.running = true
+  }
+
   IpcHandler {
     target: root.moduleName
 
@@ -94,6 +165,16 @@ BarWidget {
           fillMode: Image.PreserveAspectFit
           source: root.iconSource
           smooth: true
+        }
+
+        Rectangle {
+          visible: root.hasNewFile
+          width: Style.space(6)
+          height: Style.space(6)
+          radius: width / 2
+          color: root.bar ? root.bar.urgent : Color.urgent
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
         }
       }
     }
@@ -151,6 +232,30 @@ BarWidget {
 
       PanelSeparator { foreground: root.foreground }
 
+      Column {
+        width: parent.width
+        visible: root.recentFiles.length > 0
+        spacing: Style.spacing.labelGap
+
+        PanelSectionHeader {
+          text: "RECENT FILES"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Repeater {
+          model: root.recentFiles
+
+          RecentFileRow {
+            required property var modelData
+            name: modelData.name
+            mtime: modelData.mtime
+          }
+        }
+      }
+
+      PanelSeparator { visible: root.recentFiles.length > 0; foreground: root.foreground }
+
       Text {
         width: parent.width
         text: "Drop a file on the bar icon to send it directly, or open LocalSend to browse nearby devices."
@@ -172,6 +277,7 @@ BarWidget {
   }
 
   component InfoPair: Row {
+    id: pairRoot
     property string label: ""
     property string value: ""
 
@@ -179,18 +285,45 @@ BarWidget {
     spacing: Style.space(8)
 
     Text {
-      text: label
+      id: labelText
+      text: pairRoot.label
       opacity: 0.6
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
     }
-    Item {
-      width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth - parent.spacing * 2)
-      height: 1
+    Text {
+      text: pairRoot.value
+      elide: Text.ElideMiddle
+      horizontalAlignment: Text.AlignRight
+      width: Math.max(Style.space(20), pairRoot.width - labelText.implicitWidth - pairRoot.spacing)
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+  }
+
+  component RecentFileRow: Row {
+    id: fileRow
+    property string name: ""
+    property real mtime: 0
+
+    width: parent.width
+    spacing: Style.space(8)
+
+    Text {
+      id: timeText
+      text: Qt.formatDateTime(new Date(fileRow.mtime * 1000), "HH:mm")
+      opacity: 0.6
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
     }
     Text {
-      text: value
+      id: nameText
+      text: fileRow.name
+      elide: Text.ElideMiddle
+      width: Math.max(Style.space(20), fileRow.width - timeText.implicitWidth - fileRow.spacing)
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall

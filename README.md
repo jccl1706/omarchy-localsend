@@ -34,13 +34,18 @@ need `omarchy restart shell` rather than relying on hot-reload.)
   file via `localsend-cli -f <path>`; select a discovered device to send it.
 - Click the icon again (or click outside) to open/close the popup, which
   shows the device alias, port, and download destination read from
-  `~/.config/localsend-cli/config.toml`.
+  `~/.config/localsend-cli/config.toml`, plus the last few files received.
+- A small dot appears on the bar icon when a file arrives while the popup
+  is closed, and a desktop notification fires for every received file. The
+  dot clears the next time you open the popup.
 
 ## Configuration
 
 This plugin has no settings of its own. It reflects `localsend-cli`'s own
 config file; edit `~/.config/localsend-cli/config.toml` to change the alias,
-port, or download destination (see the comments in that file).
+port, or download destination (see the comments in that file) — the recent
+files list and notifications follow the same destination folder
+automatically.
 
 ## Removal
 
