@@ -33,6 +33,48 @@ BarWidget {
   property var recentFiles: []
   property bool hasNewFile: false
 
+  // localsend-cli is a TUI with no daemon mode: it only listens for incoming
+  // transfers while its process is running, and only one instance can hold
+  // the port at a time. So exactly one instance runs at all times — hidden
+  // in a detached tmux session (a real pty, which the TUI requires) whenever
+  // nothing else needs the terminal, swapped for a visible interactive one
+  // while browsing/sending, then swapped back on exit. tmux is optional: if
+  // it's missing, this degrades to the old on-demand-only behavior.
+  readonly property string bgSession: "omarchy-localsend-receiver"
+  property bool tmuxAvailable: false
+  property bool receiving: false
+
+  // A real file rather than an inline `bash -c "a; b; c"` string: the launch
+  // command passes through omarchy-launch-or-focus-tui's own argv handling,
+  // which flattens and re-parses it along the way — a semicolon-chained
+  // string loses its quoting there and only the first command survives. A
+  // plain script path plus simple `-f <path>` tokens has no such characters
+  // to lose, so it round-trips intact (same shape as the plain -f case).
+  readonly property string helperDir: Quickshell.env("HOME") + "/.local/state/omarchy-localsend"
+  readonly property string helperPath: helperDir + "/interactive.sh"
+  readonly property string helperScript:
+    "#!/bin/bash\n" +
+    "SESSION=" + Util.shellQuote(bgSession) + "\n" +
+    "tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
+    "localsend-cli \"$@\"\n" +
+    "tmux new-session -d -s \"$SESSION\" localsend-cli\n"
+
+  function installHelperScript() {
+    installHelperProc.command = ["bash", "-c",
+      "mkdir -p " + Util.shellQuote(helperDir)
+      + " && printf '%s' " + Util.shellQuote(helperScript) + " > " + Util.shellQuote(helperPath)
+      + " && chmod +x " + Util.shellQuote(helperPath)]
+    installHelperProc.running = true
+  }
+
+  function ensureBackgroundReceiver() {
+    if (tmuxAvailable && !ensureBgProc.running) ensureBgProc.running = true
+  }
+
+  function checkReceivingStatus() {
+    if (tmuxAvailable && !statusCheckProc.running) statusCheckProc.running = true
+  }
+
   function parseToml(text, key, fallback) {
     if (!text) return fallback
     var re = new RegExp("^\\s*" + key + "\\s*=\\s*\"?([^\"\\n]*?)\"?\\s*$", "m")
@@ -74,6 +116,8 @@ BarWidget {
   Component.onCompleted: {
     receiveWatcher.running = true
     refreshRecentFiles()
+    installHelperScript()
+    tmuxCheckProc.running = true
   }
 
   function urlToPath(url) {
@@ -88,11 +132,21 @@ BarWidget {
 
   function openLocalSend(filePaths) {
     if (!bar) return
-    var cmd = "omarchy-launch-or-focus-tui --app-id=" + appId + " localsend-cli"
-    for (var i = 0; i < filePaths.length; i++) {
-      cmd += " -f " + Util.shellQuote(filePaths[i])
+    var fileArgs = ""
+    for (var i = 0; i < filePaths.length; i++) fileArgs += " -f " + Util.shellQuote(filePaths[i])
+
+    var command
+    if (tmuxAvailable) {
+      // The helper script frees the port from the background receiver, runs
+      // the interactive session in view, then brings the background
+      // receiver back once it exits.
+      command = Util.shellQuote(helperPath) + fileArgs
+      root.receiving = false
+    } else {
+      command = "localsend-cli" + fileArgs
     }
-    bar.run(cmd)
+
+    bar.run("omarchy-launch-or-focus-tui --app-id=" + appId + " " + command)
     root.close()
   }
 
@@ -143,6 +197,50 @@ BarWidget {
     onTriggered: receiveWatcher.running = true
   }
 
+  Process {
+    id: installHelperProc
+  }
+
+  Process {
+    id: tmuxCheckProc
+    command: ["bash", "-c", "command -v tmux >/dev/null 2>&1 && echo yes || echo no"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.tmuxAvailable = text.trim() === "yes"
+        if (root.tmuxAvailable) root.ensureBackgroundReceiver()
+      }
+    }
+  }
+
+  Process {
+    id: ensureBgProc
+    command: ["bash", "-c",
+      "tmux has-session -t " + Util.shellQuote(root.bgSession) + " 2>/dev/null || "
+      + "tmux new-session -d -s " + Util.shellQuote(root.bgSession) + " localsend-cli"]
+    onExited: root.checkReceivingStatus()
+  }
+
+  Process {
+    id: statusCheckProc
+    command: ["bash", "-c", "tmux has-session -t " + Util.shellQuote(root.bgSession) + " 2>/dev/null && echo yes || echo no"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.receiving = text.trim() === "yes"
+    }
+  }
+
+  // Safety net for when the background receiver dies outside our control
+  // (crash, forced-closed terminal skipping the restart chain in
+  // openLocalSend, first boot). Cheap to poll — tmux has-session is instant.
+  Timer {
+    interval: 20000
+    running: root.tmuxAvailable
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.ensureBackgroundReceiver()
+  }
+
   IpcHandler {
     target: root.moduleName
 
@@ -151,6 +249,7 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
+    function send(): void { root.openLocalSend([]) }
   }
 
   BarIconButton {
@@ -218,6 +317,37 @@ BarWidget {
             source: root.iconSource
           }
         }
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.tmuxAvailable
+
+        Rectangle {
+          width: Style.space(8)
+          height: Style.space(8)
+          radius: width / 2
+          anchors.verticalCenter: parent.verticalCenter
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, root.receiving ? 1.0 : 0.25)
+        }
+        Text {
+          text: root.receiving ? "Receiving in background" : "Not receiving right now"
+          opacity: 0.8
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+
+      Text {
+        width: parent.width
+        visible: !root.tmuxAvailable
+        wrapMode: Text.WordWrap
+        text: "Install tmux to keep this PC reachable for incoming files even when this popup is closed."
+        color: Qt.darker(root.foreground, 1.3)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
       }
 
       PanelSeparator { foreground: root.foreground }
