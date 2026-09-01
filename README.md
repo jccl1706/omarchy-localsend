@@ -75,7 +75,10 @@ it clears the next time you open the popup.
   omarchy-shell io.github.jccl1706.localsend toggleBackgroundReceiving
   ```
   Disabling or removing the plugin kills the background listener and deletes
-  its generated helper files.
+  its generated helper files. The listener also polls its own installed
+  plugin directory and shuts itself down within a few seconds of that
+  directory disappearing even if the shell wasn't running to unload it
+  first — e.g. `omarchy plugin remove` while the shell is stopped.
 - **Everything else** — reflects `localsend-cli`'s own config. Edit
   `~/.config/localsend-cli/config.toml` to change the alias, port, or
   download destination (see the comments in that file); the recent-files

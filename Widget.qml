@@ -43,6 +43,30 @@ BarWidget {
   readonly property string bgSession: "omarchy-localsend-receiver"
   property bool tmuxAvailable: false
   property bool receiving: false
+  // Component.onDestruction (below) kills the background session the moment
+  // the plugin is disabled or removed with the shell running, but the shell
+  // isn't always running when `omarchy plugin remove` deletes this plugin's
+  // folder — that command deletes files unconditionally even if it can't
+  // reach a live shell to unload them first. So the background session also
+  // polls its own installed-plugin directory and self-terminates within a
+  // few seconds of that directory disappearing, whether or not this widget
+  // instance ever got a chance to run its own cleanup. Verified directly:
+  // a background job polling a scratch directory this way kept its listener
+  // alive normally, then exited (process and tmux session both gone) within
+  // 2s of that directory being removed out from under it.
+  readonly property string installedPluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/" + moduleName
+  readonly property string backgroundWatchdogScript:
+    "PLUGIN_DIR=" + Util.shellQuote(installedPluginDir) + "\n" +
+    "while [[ -d \"$PLUGIN_DIR\" ]]; do\n" +
+    "  localsend-cli &\n" +
+    "  pid=$!\n" +
+    "  while kill -0 \"$pid\" 2>/dev/null; do\n" +
+    "    [[ -d \"$PLUGIN_DIR\" ]] || { kill \"$pid\" 2>/dev/null; break; }\n" +
+    "    sleep 5\n" +
+    "  done\n" +
+    "  wait \"$pid\" 2>/dev/null\n" +
+    "  [[ -d \"$PLUGIN_DIR\" ]] || break\n" +
+    "done\n"
   // Opt-in, not opt-out: silently starting a hidden background listener (and
   // persisting an executable helper script) the first time this plugin loads
   // would run code the user never asked for. Background receiving only turns
@@ -124,35 +148,53 @@ BarWidget {
     "FLAG=" + Util.shellQuote(backgroundEnabledFlagPath) + "\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     "ARGS=()\n" +
+    // Checking a path and then separately opening/reading/deleting it is
+    // itself a race: whatever sits at that path can change between each of
+    // those pathname lookups. So this opens the path exactly once (fd 3) and
+    // does every check, the read, and nothing else, against that same
+    // already-open file description via /proc/self/fd/3 — which always
+    // refers to the file that got opened, never whatever the path currently
+    // resolves to. Only the final `rm -f` still names the path, but by then
+    // its content has already been fully read (or rejected) from the fd, so
+    // whatever it deletes can't change that outcome.
+    // No 2>/dev/null on this exec: since it has no command, any redirection
+    // after the failing one would apply to the shell's own stderr for the
+    // rest of the script the moment the open succeeds (verified directly —
+    // exec's own redirections are cumulative and permanent, not scoped to
+    // one command). A failed open here just prints one harmless diagnostic
+    // line and the surrounding `&&` lets the script continue past it.
+    "if [[ -n \"$1\" ]] && exec 3<\"$1\"; then\n" +
+    "  if [[ -f /proc/self/fd/3 && -O /proc/self/fd/3 ]]; then\n" +
+    "    size=$(stat -c%s -- /proc/self/fd/3 2>/dev/null || echo -1)\n" +
     // The list file is deleted below on every path through this block, but
-    // it's re-validated on every read rather than trusted just because it
-    // sits at a path this script itself wrote: a regular, non-symlink file
+    // its content is re-validated on every read rather than trusted just
+    // because it sits at a path this script itself wrote: a regular file
     // owned by this user, within a total-size bound consistent with at most
     // maxDroppedFiles records of at most maxPathLength bytes each. Any
     // record exceeding those per-record bounds aborts the whole batch
     // (ARGS cleared) instead of silently truncating to the cap, since a
     // file that big or that record-heavy is not one this script wrote.
-    "if [[ -n \"$1\" && -f \"$1\" && ! -L \"$1\" && -O \"$1\" ]]; then\n" +
-    "  size=$(stat -c%s -- \"$1\" 2>/dev/null || echo -1)\n" +
-    "  if (( size >= 0 && size <= " + (maxPathLength * maxDroppedFiles) + " )); then\n" +
-    "    count=0\n" +
-    "    ok=1\n" +
+    "    if (( size >= 0 && size <= " + (maxPathLength * maxDroppedFiles) + " )); then\n" +
+    "      count=0\n" +
+    "      ok=1\n" +
     // NUL-delimited, not newline-delimited: a Linux filename may legally
     // contain a newline, so reading line-by-line would let a crafted
     // filename inject an extra, attacker-chosen -f argument. NUL is the one
     // byte that can never appear in a filename, so it's unambiguous.
-    "    while IFS= read -r -d '' line; do\n" +
-    "      count=$((count + 1))\n" +
-    "      if (( count > " + maxDroppedFiles + " || ${#line} > " + maxPathLength + " )); then ok=0; break; fi\n" +
-    "      [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
-    "    done < \"$1\"\n" +
-    "    [[ \"$ok\" == 1 ]] || ARGS=()\n" +
+    "      while IFS= read -r -d '' -u 3 line; do\n" +
+    "        count=$((count + 1))\n" +
+    "        if (( count > " + maxDroppedFiles + " || ${#line} > " + maxPathLength + " )); then ok=0; break; fi\n" +
+    "        [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
+    "      done\n" +
+    "      [[ \"$ok\" == 1 ]] || ARGS=()\n" +
+    "    fi\n" +
     "  fi\n" +
-    "  rm -f \"$1\"\n" +
+    "  exec 3<&-\n" +
+    "  rm -f -- \"$1\"\n" +
     "fi\n" +
     "localsend-cli \"${ARGS[@]}\"\n" +
     "if command -v tmux >/dev/null 2>&1 && [[ \"$(cat \"$FLAG\" 2>/dev/null)\" != \"0\" ]]; then\n" +
-    "  tmux new-session -d -s \"$SESSION\" localsend-cli\n" +
+    "  tmux new-session -d -s \"$SESSION\" bash -c " + Util.shellQuote(backgroundWatchdogScript) + "\n" +
     "fi\n"
 
   function installHelperScript() {
@@ -417,7 +459,7 @@ BarWidget {
     id: ensureBgProc
     command: ["bash", "-c",
       "tmux has-session -t " + Util.shellQuote(root.bgSession) + " 2>/dev/null || "
-      + "tmux new-session -d -s " + Util.shellQuote(root.bgSession) + " localsend-cli"]
+      + "tmux new-session -d -s " + Util.shellQuote(root.bgSession) + " bash -c " + Util.shellQuote(root.backgroundWatchdogScript)]
     onExited: root.checkReceivingStatus()
   }
 
