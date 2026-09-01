@@ -90,7 +90,11 @@ BarWidget {
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     "ARGS=()\n" +
     "if [[ -n \"$1\" && -f \"$1\" ]]; then\n" +
-    "  while IFS= read -r line; do\n" +
+    // NUL-delimited, not newline-delimited: a Linux filename may legally
+    // contain a newline, so reading line-by-line would let a crafted
+    // filename inject an extra, attacker-chosen -f argument. NUL is the one
+    // byte that can never appear in a filename, so it's unambiguous.
+    "  while IFS= read -r -d '' line; do\n" +
     "    [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
     "  done < \"$1\"\n" +
     "  rm -f \"$1\"\n" +
@@ -124,12 +128,16 @@ BarWidget {
 
   // Runs entirely through our own Process (a real exec array, no shell
   // re-parsing), so paths with spaces or quotes are safe here even though
-  // they aren't once they'd cross omarchy-launch-or-focus-tui.
+  // they aren't once they'd cross omarchy-launch-or-focus-tui. Each path is
+  // its own argv element (never concatenated into one string), and printf's
+  // %s\0 gives each a NUL terminator on the way into the file — matching
+  // the NUL-delimited reader in helperScript. A newline embedded in a
+  // filename is just a byte in one argument here, not a record separator,
+  // so it can't inject an extra path the way joining with "\n" could.
   function writeFileList(filePaths, onWritten) {
-    var content = ""
-    for (var i = 0; i < filePaths.length; i++) content += filePaths[i] + "\n"
-    writeFileListProc.command = ["bash", "-c",
-      "printf '%s' " + Util.shellQuote(content) + " > " + Util.shellQuote(fileListPath)]
+    var command = ["bash", "-c", "printf '%s\\0' \"$@\" > " + Util.shellQuote(fileListPath), "omarchy-localsend"]
+    for (var i = 0; i < filePaths.length; i++) command.push(filePaths[i])
+    writeFileListProc.command = command
     writeFileListProc.onWritten = onWritten
     writeFileListProc.running = true
   }
