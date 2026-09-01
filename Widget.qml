@@ -43,6 +43,26 @@ BarWidget {
   readonly property string bgSession: "omarchy-localsend-receiver"
   property bool tmuxAvailable: false
   property bool receiving: false
+  readonly property bool backgroundReceivingEnabled: setting("backgroundReceiving", true) === true
+
+  function setBackgroundReceivingEnabled(enabled) {
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.backgroundReceiving = enabled
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function toggleBackgroundReceiving() {
+    setBackgroundReceivingEnabled(!backgroundReceivingEnabled)
+  }
+
+  onBackgroundReceivingEnabledChanged: {
+    writeBackgroundEnabledFlag()
+    if (backgroundReceivingEnabled) ensureBackgroundReceiver()
+    else disableBackgroundReceiver()
+  }
 
   // A real file rather than an inline `bash -c "a; b; c"` string: the launch
   // command passes through omarchy-launch-or-focus-tui's own argv handling,
@@ -59,9 +79,14 @@ BarWidget {
   readonly property string helperDir: Quickshell.env("HOME") + "/.local/state/omarchy-localsend"
   readonly property string helperPath: helperDir + "/interactive.sh"
   readonly property string fileListPath: helperDir + "/pending-files.list"
+  // Read fresh by the script at restart time — not baked in at install time —
+  // so toggling the setting mid-session (including while an interactive
+  // session is open) takes effect the moment that session closes.
+  readonly property string backgroundEnabledFlagPath: helperDir + "/background-enabled"
   readonly property string helperScript:
     "#!/bin/bash\n" +
     "SESSION=" + Util.shellQuote(bgSession) + "\n" +
+    "FLAG=" + Util.shellQuote(backgroundEnabledFlagPath) + "\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     "ARGS=()\n" +
     "if [[ -n \"$1\" && -f \"$1\" ]]; then\n" +
@@ -71,7 +96,9 @@ BarWidget {
     "  rm -f \"$1\"\n" +
     "fi\n" +
     "localsend-cli \"${ARGS[@]}\"\n" +
-    "command -v tmux >/dev/null 2>&1 && tmux new-session -d -s \"$SESSION\" localsend-cli\n"
+    "if command -v tmux >/dev/null 2>&1 && [[ \"$(cat \"$FLAG\" 2>/dev/null)\" != \"0\" ]]; then\n" +
+    "  tmux new-session -d -s \"$SESSION\" localsend-cli\n" +
+    "fi\n"
 
   function installHelperScript() {
     installHelperProc.command = ["bash", "-c",
@@ -79,6 +106,20 @@ BarWidget {
       + " && printf '%s' " + Util.shellQuote(helperScript) + " > " + Util.shellQuote(helperPath)
       + " && chmod +x " + Util.shellQuote(helperPath)]
     installHelperProc.running = true
+  }
+
+  function writeBackgroundEnabledFlag() {
+    writeFlagProc.command = ["bash", "-c",
+      "mkdir -p " + Util.shellQuote(helperDir)
+      + " && printf '%s' " + Util.shellQuote(backgroundReceivingEnabled ? "1" : "0") + " > " + Util.shellQuote(backgroundEnabledFlagPath)]
+    writeFlagProc.running = true
+  }
+
+  function disableBackgroundReceiver() {
+    disableBgProc.command = ["bash", "-c",
+      "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null"]
+    disableBgProc.running = true
+    root.receiving = false
   }
 
   // Runs entirely through our own Process (a real exec array, no shell
@@ -94,7 +135,7 @@ BarWidget {
   }
 
   function ensureBackgroundReceiver() {
-    if (tmuxAvailable && !ensureBgProc.running) ensureBgProc.running = true
+    if (tmuxAvailable && backgroundReceivingEnabled && !ensureBgProc.running) ensureBgProc.running = true
   }
 
   function checkReceivingStatus() {
@@ -143,6 +184,7 @@ BarWidget {
     receiveWatcher.running = true
     refreshRecentFiles()
     installHelperScript()
+    writeBackgroundEnabledFlag()
     tmuxCheckProc.running = true
   }
 
@@ -251,6 +293,14 @@ BarWidget {
   }
 
   Process {
+    id: disableBgProc
+  }
+
+  Process {
+    id: writeFlagProc
+  }
+
+  Process {
     id: statusCheckProc
     command: ["bash", "-c", "tmux has-session -t " + Util.shellQuote(root.bgSession) + " 2>/dev/null && echo yes || echo no"]
     stdout: StdioCollector {
@@ -264,7 +314,7 @@ BarWidget {
   // openLocalSend, first boot). Cheap to poll — tmux has-session is instant.
   Timer {
     interval: 20000
-    running: root.tmuxAvailable
+    running: root.tmuxAvailable && root.backgroundReceivingEnabled
     repeat: true
     triggeredOnStart: true
     onTriggered: root.ensureBackgroundReceiver()
@@ -279,6 +329,7 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function send(): void { root.openLocalSend([]) }
+    function toggleBackgroundReceiving(): void { root.toggleBackgroundReceiving() }
   }
 
   BarIconButton {
@@ -348,24 +399,45 @@ BarWidget {
         }
       }
 
-      Row {
+      Item {
         width: parent.width
-        spacing: Style.space(8)
         visible: root.tmuxAvailable
+        implicitHeight: Math.max(statusRow.implicitHeight, receivingToggle.implicitHeight)
 
-        Rectangle {
-          width: Style.space(8)
-          height: Style.space(8)
-          radius: width / 2
+        Row {
+          id: statusRow
+          anchors.left: parent.left
+          anchors.right: receivingToggle.left
+          anchors.rightMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
-          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, root.receiving ? 1.0 : 0.25)
+          spacing: Style.space(8)
+
+          Rectangle {
+            width: Style.space(8)
+            height: Style.space(8)
+            radius: width / 2
+            anchors.verticalCenter: parent.verticalCenter
+            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b,
+              !root.backgroundReceivingEnabled ? 0.1 : (root.receiving ? 1.0 : 0.25))
+          }
+          Text {
+            text: !root.backgroundReceivingEnabled
+              ? "Background receiving off"
+              : (root.receiving ? "Receiving in background" : "Not receiving right now")
+            opacity: 0.8
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
         }
-        Text {
-          text: root.receiving ? "Receiving in background" : "Not receiving right now"
-          opacity: 0.8
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
+
+        ToggleSwitch {
+          id: receivingToggle
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          checked: root.backgroundReceivingEnabled
+          foreground: root.foreground
+          onToggled: root.toggleBackgroundReceiving()
         }
       }
 

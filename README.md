@@ -35,7 +35,9 @@ need `omarchy restart shell` rather than relying on hot-reload.)
 - With `tmux` installed, a hidden `localsend-cli` instance runs in the
   background automatically as soon as the plugin loads, so this PC is
   reachable for incoming files at all times — the popup's status row shows
-  "Receiving in background" while it's active.
+  "Receiving in background" while it's active. Flip the toggle next to it
+  to turn this off if you'd rather this PC only be reachable while you have
+  the widget open.
 - **Click** the icon in the bar: swaps the background receiver for the same
   `localsend-cli` TUI in a floating terminal (via `omarchy-launch-or-focus-tui`)
   to browse nearby devices and pair them. Closing that terminal automatically
@@ -51,11 +53,13 @@ need `omarchy restart shell` rather than relying on hot-reload.)
 
 ## Configuration
 
-This plugin has no settings of its own. It reflects `localsend-cli`'s own
-config file; edit `~/.config/localsend-cli/config.toml` to change the alias,
-port, or download destination (see the comments in that file) — the recent
-files list and notifications follow the same destination folder
-automatically.
+- **Background receiving** — the toggle in the popup (persisted to
+  `shell.json`). Also available over IPC:
+  `omarchy-shell io.github.jccl1706.localsend toggleBackgroundReceiving`.
+- Everything else reflects `localsend-cli`'s own config file; edit
+  `~/.config/localsend-cli/config.toml` to change the alias, port, or
+  download destination (see the comments in that file) — the recent files
+  list and notifications follow the same destination folder automatically.
 
 ## Removal
 
