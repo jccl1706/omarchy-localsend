@@ -79,6 +79,37 @@ BarWidget {
   readonly property string helperDir: Quickshell.env("HOME") + "/.local/state/omarchy-localsend"
   readonly property string helperPath: helperDir + "/interactive.sh"
   readonly property string fileListPath: helperDir + "/pending-files.list"
+
+  // Shared by every write below. safe_dir refuses to use helperDir if it
+  // already exists as a symlink or non-directory, and creates it private
+  // (0700) otherwise. safe_write never opens the target path directly —
+  // it writes to a fresh mktemp file in the same directory (so the rename
+  // is atomic, same filesystem) and refuses a pre-existing symlink or
+  // non-regular file at the target, then atomically renames into place.
+  // A predictable path under a private, verified directory plus an atomic
+  // rename closes the window a plain `> file` redirect leaves open: a
+  // symlink planted at that path ahead of time could otherwise redirect
+  // the write to truncate some unrelated file the user owns.
+  readonly property string safeWriteLib:
+    "safe_dir() {\n" +
+    "  local dir=\"$1\"\n" +
+    "  if [[ -e \"$dir\" || -L \"$dir\" ]]; then\n" +
+    "    if [[ -L \"$dir\" || ! -d \"$dir\" ]]; then echo \"refusing: $dir is not a plain directory\" >&2; return 1; fi\n" +
+    "  else\n" +
+    "    mkdir -m 700 -- \"$dir\" || return 1\n" +
+    "  fi\n" +
+    "  chmod 700 -- \"$dir\" 2>/dev/null\n" +
+    "}\n" +
+    "safe_write() {\n" +
+    "  local target=\"$1\" mode=\"$2\" dir tmp\n" +
+    "  dir=$(dirname -- \"$target\")\n" +
+    "  if [[ -L \"$target\" ]]; then echo \"refusing: $target is a symlink\" >&2; return 1; fi\n" +
+    "  if [[ -e \"$target\" && ! -f \"$target\" ]]; then echo \"refusing: $target is not a regular file\" >&2; return 1; fi\n" +
+    "  tmp=$(mktemp -- \"$dir/.tmp.XXXXXX\") || return 1\n" +
+    "  chmod \"$mode\" -- \"$tmp\"\n" +
+    "  cat > \"$tmp\" || { rm -f -- \"$tmp\"; return 1; }\n" +
+    "  mv -f -- \"$tmp\" \"$target\"\n" +
+    "}\n"
   // Read fresh by the script at restart time — not baked in at install time —
   // so toggling the setting mid-session (including while an interactive
   // session is open) takes effect the moment that session closes.
@@ -106,16 +137,17 @@ BarWidget {
 
   function installHelperScript() {
     installHelperProc.command = ["bash", "-c",
-      "mkdir -p " + Util.shellQuote(helperDir)
-      + " && printf '%s' " + Util.shellQuote(helperScript) + " > " + Util.shellQuote(helperPath)
-      + " && chmod +x " + Util.shellQuote(helperPath)]
+      safeWriteLib
+      + "safe_dir " + Util.shellQuote(helperDir) + " || exit 1\n"
+      + "printf '%s' " + Util.shellQuote(helperScript) + " | safe_write " + Util.shellQuote(helperPath) + " 700\n"]
     installHelperProc.running = true
   }
 
   function writeBackgroundEnabledFlag() {
     writeFlagProc.command = ["bash", "-c",
-      "mkdir -p " + Util.shellQuote(helperDir)
-      + " && printf '%s' " + Util.shellQuote(backgroundReceivingEnabled ? "1" : "0") + " > " + Util.shellQuote(backgroundEnabledFlagPath)]
+      safeWriteLib
+      + "safe_dir " + Util.shellQuote(helperDir) + " || exit 1\n"
+      + "printf '%s' " + Util.shellQuote(backgroundReceivingEnabled ? "1" : "0") + " | safe_write " + Util.shellQuote(backgroundEnabledFlagPath) + " 600\n"]
     writeFlagProc.running = true
   }
 
@@ -134,11 +166,16 @@ BarWidget {
   // the NUL-delimited reader in helperScript. A newline embedded in a
   // filename is just a byte in one argument here, not a record separator,
   // so it can't inject an extra path the way joining with "\n" could.
-  function writeFileList(filePaths, onWritten) {
-    var command = ["bash", "-c", "printf '%s\\0' \"$@\" > " + Util.shellQuote(fileListPath), "omarchy-localsend"]
+  function writeFileList(filePaths, onWritten, onFailed) {
+    var command = ["bash", "-c",
+      safeWriteLib
+      + "safe_dir " + Util.shellQuote(helperDir) + " || exit 1\n"
+      + "printf '%s\\0' \"$@\" | safe_write " + Util.shellQuote(fileListPath) + " 600\n",
+      "omarchy-localsend"]
     for (var i = 0; i < filePaths.length; i++) command.push(filePaths[i])
     writeFileListProc.command = command
     writeFileListProc.onWritten = onWritten
+    writeFileListProc.onFailed = onFailed
     writeFileListProc.running = true
   }
 
@@ -182,6 +219,8 @@ BarWidget {
 
   onDestinationDirChanged: {
     receiveWatcher.running = false
+    watcherFailureCount = 0
+    receiveWatcherRestart.interval = 5000
     receiveWatcherRestart.restart()
     refreshRecentFiles()
   }
@@ -196,10 +235,23 @@ BarWidget {
     tmuxCheckProc.running = true
   }
 
+  readonly property int maxDroppedFiles: 64
+  readonly property int maxPathLength: 4096
+
+  // Returns null for anything that isn't an actual local file: URL, or
+  // whose decoded path is empty/implausibly long — a drag source offering
+  // e.g. an http: or data: URL should never reach argv or a written file.
   function urlToPath(url) {
     var s = url.toString()
-    if (s.indexOf("file://") === 0) s = s.substring(7)
-    return decodeURIComponent(s)
+    if (s.indexOf("file://") !== 0) return null
+    var decoded
+    try {
+      decoded = decodeURIComponent(s.substring(7))
+    } catch (e) {
+      return null
+    }
+    if (decoded.length === 0 || decoded.length > maxPathLength) return null
+    return decoded
   }
 
   function open() { popup.open = true }
@@ -217,7 +269,9 @@ BarWidget {
     }
 
     if (filePaths.length > 0) {
-      writeFileList(filePaths, function() { launch(fileListPath) })
+      writeFileList(filePaths, function() { launch(fileListPath) }, function() {
+        console.warn("io.github.jccl1706.localsend: failed to write the file list; not launching")
+      })
     } else {
       launch("")
     }
@@ -261,7 +315,26 @@ BarWidget {
         root.notifyReceived(filename)
       }
     }
-    onExited: receiveWatcherRestart.restart()
+    // Exponential backoff (5s, 10s, 20s, ... capped at 5 minutes) instead of
+    // retrying every 5s forever — e.g. if the destination folder can never
+    // be created, this shouldn't spin indefinitely at a fixed fast interval.
+    // watcherStableTimer resets the count once a run has stayed up a while,
+    // so a later transient failure still starts back at the short delay.
+    onExited: {
+      root.watcherFailureCount = Math.min(root.watcherFailureCount + 1, 6)
+      watcherStableTimer.stop()
+      receiveWatcherRestart.interval = Math.min(5000 * Math.pow(2, root.watcherFailureCount - 1), 300000)
+      receiveWatcherRestart.restart()
+    }
+    onRunningChanged: if (running) watcherStableTimer.restart()
+  }
+
+  property int watcherFailureCount: 0
+
+  Timer {
+    id: watcherStableTimer
+    interval: 10000
+    onTriggered: root.watcherFailureCount = 0
   }
 
   Timer {
@@ -277,7 +350,11 @@ BarWidget {
   Process {
     id: writeFileListProc
     property var onWritten: null
-    onExited: if (onWritten) onWritten()
+    property var onFailed: null
+    onExited: function(exitCode) {
+      if (exitCode === 0) { if (onWritten) onWritten() }
+      else { if (onFailed) onFailed() }
+    }
   }
 
   Process {
@@ -372,7 +449,11 @@ BarWidget {
     anchors.fill: parent
     onDropped: function(drop) {
       var paths = []
-      for (var i = 0; i < drop.urls.length; i++) paths.push(root.urlToPath(drop.urls[i]))
+      var count = Math.min(drop.urls.length, root.maxDroppedFiles)
+      for (var i = 0; i < count; i++) {
+        var p = root.urlToPath(drop.urls[i])
+        if (p) paths.push(p)
+      }
       if (paths.length > 0) root.openLocalSend(paths)
     }
   }

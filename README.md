@@ -28,6 +28,8 @@ bar — send and receive files over the LAN without leaving your desktop.
 | Requirement | Why |
 |---|---|
 | `localsend-cli` on `$PATH` (`localsend` package) | Does the actual sending/receiving |
+| `inotifywait` (`inotify-tools` package) | Watches the destination folder for the recent-files list and arrival notifications |
+| `bash` | The interactive-launch helper script and every background process it manages |
 | `tmux` (recommended) | Keeps this PC reachable in the background. Without it, `localsend-cli` only listens while the widget's terminal is open — it has no daemon mode of its own |
 
 ## Install
