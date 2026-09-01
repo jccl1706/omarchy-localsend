@@ -22,9 +22,20 @@ BarWidget {
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property string deviceAlias: parseToml(configFile.text(), "alias", hostnameFile.text().trim() || "This device")
-  readonly property string port: parseToml(configFile.text(), "port", "53317")
-  readonly property string destination: parseToml(configFile.text(), "destination", "~/Downloads")
+  // config.toml is user-writable and re-read on every change; parsing it
+  // via regex against a QString loaded whole into memory (FileView's normal
+  // .text()) has no ceiling of its own, so an oversized file — a mistake or
+  // a same-uid process replacing it — could exhaust memory/CPU repeatedly
+  // in this long-lived shell process just from the read and each regex
+  // match against it. configText is instead produced by `head -c`, which
+  // stops after maxConfigBytes regardless of the file's real size, so nothing
+  // downstream (parseToml's regex, or any future consumer) ever sees more
+  // than that ceiling to begin with.
+  readonly property int maxConfigBytes: 65536
+  property string configText: ""
+  readonly property string deviceAlias: parseToml(configText, "alias", hostnameFile.text().trim() || "This device")
+  readonly property string port: parseToml(configText, "port", "53317")
+  readonly property string destination: parseToml(configText, "destination", "~/Downloads")
   readonly property string destinationDir: destination.indexOf("~") === 0
     ? Quickshell.env("HOME") + destination.substring(1)
     : destination
@@ -385,6 +396,10 @@ BarWidget {
     return match && match[1].length > 0 ? match[1] : fallback
   }
 
+  function readConfigBounded() {
+    if (!configReadProc.running) configReadProc.running = true
+  }
+
   function updateRecentFiles(text) {
     var lines = String(text || "").split("\n").filter(function(l) { return l.length > 0 })
     var files = []
@@ -424,6 +439,7 @@ BarWidget {
     installHelperScript()
     writeBackgroundEnabledFlag()
     tmuxCheckProc.running = true
+    readConfigBounded()
   }
 
   // Disabling or removing the plugin destroys this Item (the bar's Loader
@@ -495,12 +511,22 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // Used only to detect that config.toml changed — its own .text()/.data()
+  // are never called, so this never loads the file's content into memory
+  // itself; readConfigBounded() (via `head -c`) is what actually produces
+  // configText, capped regardless of the real file size.
   FileView {
     id: configFile
     path: root.configPath
     watchChanges: true
     printErrors: false
-    onFileChanged: reload()
+    onFileChanged: root.readConfigBounded()
+  }
+
+  Process {
+    id: configReadProc
+    command: ["bash", "-c", "head -c " + root.maxConfigBytes + " -- " + Util.shellQuote(root.configPath) + " 2>/dev/null"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.configText = text }
   }
 
   FileView {
@@ -510,8 +536,20 @@ BarWidget {
   }
 
   Process {
+    // `sort` must consume its entire input before emitting anything, so the
+    // trailing `head -5` only bounds the final output — a destination folder
+    // with an enormous number of entries would still make `sort` do
+    // unbounded work first. Capping with an earlier `head -n 2000` bounds
+    // what `sort` ever sees regardless of how many files actually exist
+    // (an approximation for a pathologically large folder — the "5 most
+    // recent" then means "most recent among the first 2000 find happens to
+    // encounter" — a fine tradeoff for what's just a convenience list), and
+    // the outer `timeout` is a hard wall-clock ceiling on the whole pipeline
+    // as a backstop regardless of what's bounding memory/CPU.
     id: recentFilesProc
-    command: ["bash", "-c", "find " + Util.shellQuote(root.destinationDir) + " -maxdepth 1 -type f -printf '%T@\\t%f\\n' 2>/dev/null | sort -rn | head -5"]
+    command: ["bash", "-c",
+      "timeout 3 bash -c " + Util.shellQuote(
+        "find " + Util.shellQuote(root.destinationDir) + " -maxdepth 1 -type f -printf '%T@\\t%f\\n' 2>/dev/null | head -n 2000 | sort -rn | head -5")]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateRecentFiles(text) }
   }
 
@@ -821,6 +859,7 @@ BarWidget {
 
     Text {
       id: labelText
+      textFormat: Text.PlainText
       text: pairRoot.label
       opacity: 0.6
       color: root.foreground
@@ -828,6 +867,11 @@ BarWidget {
       font.pixelSize: Style.font.bodySmall
     }
     Text {
+      // pairRoot.value is config-derived (port/destination from
+      // config.toml, which this same user could have written anything
+      // into) — PlainText so a markup-shaped value is never parsed as rich
+      // text rather than displayed as the literal string it is.
+      textFormat: Text.PlainText
       text: pairRoot.value
       elide: Text.ElideMiddle
       horizontalAlignment: Text.AlignRight
@@ -848,6 +892,7 @@ BarWidget {
 
     Text {
       id: timeText
+      textFormat: Text.PlainText
       text: Qt.formatDateTime(new Date(fileRow.mtime * 1000), "HH:mm")
       opacity: 0.6
       color: root.foreground
@@ -855,7 +900,12 @@ BarWidget {
       font.pixelSize: Style.font.bodySmall
     }
     Text {
+      // fileRow.name is a filename received over the network from another
+      // LocalSend peer — the most directly attacker-influenced string in
+      // this whole widget. PlainText so a markup-shaped filename is never
+      // parsed as rich text rather than displayed as the literal name it is.
       id: nameText
+      textFormat: Text.PlainText
       text: fileRow.name
       elide: Text.ElideMiddle
       width: Math.max(Style.space(20), fileRow.width - timeText.implicitWidth - fileRow.spacing)
