@@ -1,16 +1,32 @@
-# io.github.jccl1706.localsend
+# omarchy-localsend
 
-Omarchy shell bar-widget plugin that integrates [LocalSend](https://localsend.org)
-(installed as the `localsend-cli` package) into the Omarchy bar.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Omarchy plugin](https://img.shields.io/badge/omarchy-bar--widget-orange.svg)](https://github.com/basecamp/omarchy)
+
+A bar-widget plugin for the [Omarchy](https://omarchy.org) shell that brings
+[LocalSend](https://localsend.org) (via the `localsend-cli` package) into the
+bar — send and receive files over the LAN without leaving your desktop.
+
+## Features
+
+- **Always reachable** — a hidden `localsend-cli` instance runs in the
+  background as soon as the plugin loads, so this PC can receive files at
+  any time, popup open or not. Toggle it off if you'd rather only be
+  reachable while the widget is open.
+- **Drag and drop to send** — drop one or more files on the bar icon to pick
+  a nearby device and send them.
+- **Click to pair** — click the icon to open the `localsend-cli` TUI in a
+  floating terminal and browse/pair nearby devices.
+- **Arrival badge + notifications** — a dot appears on the icon and a desktop
+  notification fires when a file arrives; the popup lists the last few files
+  received.
 
 ## Requirements
 
-- `localsend-cli` on `$PATH` (from the `localsend` package).
-- `tmux` (optional but recommended) — lets this PC stay reachable for
-  incoming files even when the popup is closed. Without it, the plugin
-  still works, but LocalSend on this machine only listens while you have
-  the widget's terminal open (`localsend-cli` has no daemon mode of its
-  own and needs a real terminal to run at all).
+| Requirement | Why |
+|---|---|
+| `localsend-cli` on `$PATH` (`localsend` package) | Does the actual sending/receiving |
+| `tmux` (recommended) | Keeps this PC reachable in the background. Without it, `localsend-cli` only listens while the widget's terminal is open — it has no daemon mode of its own |
 
 ## Install
 
@@ -18,7 +34,8 @@ Omarchy shell bar-widget plugin that integrates [LocalSend](https://localsend.or
 omarchy plugin add https://github.com/jccl1706/omarchy-localsend.git --enable --yes
 ```
 
-Or by hand:
+<details>
+<summary>Install by hand</summary>
 
 ```bash
 cp -r . ~/.config/omarchy/plugins/io.github.jccl1706.localsend
@@ -26,39 +43,35 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.jccl1706.localsend
 ```
 
-(For local development, a symlink in place of the `cp -r` works too, but
-`omarchy-shell`'s file watcher does not follow it — after editing QML you
-need `omarchy restart shell` rather than relying on hot-reload.)
+For local development, a symlink in place of `cp -r` works too, but
+`omarchy-shell`'s file watcher does not follow it — after editing QML, run
+`omarchy restart shell` rather than relying on hot-reload.
+
+</details>
 
 ## Usage
 
-- With `tmux` installed, a hidden `localsend-cli` instance runs in the
-  background automatically as soon as the plugin loads, so this PC is
-  reachable for incoming files at all times — the popup's status row shows
-  "Receiving in background" while it's active. Flip the toggle next to it
-  to turn this off if you'd rather this PC only be reachable while you have
-  the widget open.
-- **Click** the icon in the bar: swaps the background receiver for the same
-  `localsend-cli` TUI in a floating terminal (via `omarchy-launch-or-focus-tui`)
-  to browse nearby devices and pair them. Closing that terminal automatically
-  brings the background receiver back.
-- **Drop one or more files** onto the icon: same swap, pre-loaded with those
-  files; select a discovered device to send them.
-- Click the icon again (or click outside) to open/close the popup, which
-  shows the device alias, port, and download destination read from
-  `~/.config/localsend-cli/config.toml`, plus the last few files received.
-- A small dot appears on the bar icon when a file arrives while the popup
-  is closed, and a desktop notification fires for every received file. The
-  dot clears the next time you open the popup.
+| Action | Result |
+|---|---|
+| Idle | Background receiver keeps this PC reachable; popup status row shows "Receiving in background" |
+| Click the bar icon | Opens the `localsend-cli` TUI in a floating terminal to browse and pair nearby devices |
+| Drop files on the bar icon | Opens the same TUI, pre-loaded with those files — pick a device to send |
+| Close the floating terminal | Background receiver comes back automatically |
+| Click the icon again / click outside | Opens or closes the popup — shows device alias, port, download destination, and recently received files |
+
+A dot on the bar icon marks a file that arrived while the popup was closed;
+it clears the next time you open the popup.
 
 ## Configuration
 
-- **Background receiving** — the toggle in the popup (persisted to
+- **Background receiving** — toggle in the popup (persisted to
   `shell.json`). Also available over IPC:
-  `omarchy-shell io.github.jccl1706.localsend toggleBackgroundReceiving`.
-- Everything else reflects `localsend-cli`'s own config file; edit
+  ```bash
+  omarchy-shell io.github.jccl1706.localsend toggleBackgroundReceiving
+  ```
+- **Everything else** — reflects `localsend-cli`'s own config. Edit
   `~/.config/localsend-cli/config.toml` to change the alias, port, or
-  download destination (see the comments in that file) — the recent files
+  download destination (see the comments in that file); the recent-files
   list and notifications follow the same destination folder automatically.
 
 ## Removal
@@ -67,14 +80,19 @@ need `omarchy restart shell` rather than relying on hot-reload.)
 omarchy plugin remove io.github.jccl1706.localsend --yes
 ```
 
-Or by hand: `omarchy plugin disable io.github.jccl1706.localsend`, then delete
-`~/.config/omarchy/plugins/io.github.jccl1706.localsend/`.
+Or by hand: `omarchy plugin disable io.github.jccl1706.localsend`, then
+delete `~/.config/omarchy/plugins/io.github.jccl1706.localsend/`.
 
 ## Files
 
-- `manifest.json` — plugin manifest (`kind: bar-widget`)
-- `Widget.qml` — the bar icon, popup panel, and drag-and-drop handling
-- `LICENSE` — MIT
+| File | Purpose |
+|---|---|
+| `manifest.json` | Plugin manifest (`kind: bar-widget`) |
+| `Widget.qml` | Bar icon, popup panel, and drag-and-drop handling |
+| `LICENSE` | MIT |
+
+<details>
+<summary>Implementation notes</summary>
 
 The widget writes a small helper script to
 `~/.local/state/omarchy-localsend/interactive.sh` on load, and (when sending)
@@ -92,3 +110,9 @@ The bar icon is resolved from the system's installed icon theme at runtime
 (`Quickshell.iconPath("localsend", true)`, the `localsend` package installs
 it) rather than a bundled copy — LocalSend's Apache-2.0 license covers its
 code, not a redistribution grant over its mark.
+
+</details>
+
+## License
+
+MIT — see [LICENSE](LICENSE).
