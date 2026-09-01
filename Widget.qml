@@ -12,6 +12,12 @@ BarWidget {
   moduleName: "io.github.jccl1706.localsend"
 
   readonly property string appId: "org.omarchy.localsend"
+  // Resolved from the system's installed icon theme at runtime (the same
+  // way a .desktop file's Icon= field works) rather than bundling a copy of
+  // LocalSend's icon in this repo — LocalSend's Apache-2.0 license covers
+  // the code, but its trademark clause doesn't grant redistribution rights
+  // over the mark itself.
+  readonly property string iconSource: Quickshell.iconPath("localsend", true)
   readonly property string configPath: Quickshell.env("HOME") + "/.config/localsend-cli/config.toml"
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -86,7 +92,7 @@ BarWidget {
         Image {
           anchors.fill: parent
           fillMode: Image.PreserveAspectFit
-          source: "assets/localsend.png"
+          source: root.iconSource
           smooth: true
         }
       }
@@ -128,7 +134,7 @@ BarWidget {
             width: Style.font.display
             height: Style.font.display
             fillMode: Image.PreserveAspectFit
-            source: "assets/localsend.png"
+            source: root.iconSource
           }
         }
       }

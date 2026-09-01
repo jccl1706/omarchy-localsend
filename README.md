@@ -55,6 +55,9 @@ Or by hand: `omarchy plugin disable io.github.jccl1706.localsend`, then delete
 
 - `manifest.json` — plugin manifest (`kind: bar-widget`)
 - `Widget.qml` — the bar icon, popup panel, and drag-and-drop handling
-- `assets/localsend.png` — the LocalSend app icon, bundled so the plugin
-  doesn't depend on the system icon theme
 - `LICENSE` — MIT
+
+The bar icon is resolved from the system's installed icon theme at runtime
+(`Quickshell.iconPath("localsend", true)`, the `localsend` package installs
+it) rather than a bundled copy — LocalSend's Apache-2.0 license covers its
+code, not a redistribution grant over its mark.
