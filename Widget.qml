@@ -55,15 +55,41 @@ BarWidget {
   // alive normally, then exited (process and tmux session both gone) within
   // 2s of that directory being removed out from under it.
   readonly property string installedPluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/" + moduleName
+  // Termination is bounded rather than an unbounded `wait`: once the plugin
+  // directory is gone, send TERM, give it up to 5s to exit on its own, then
+  // KILL if it hasn't — verified directly against a process that traps and
+  // ignores TERM, confirming the KILL escalation actually fires.
+  //
+  // This signals the single PID, not a process group: a `set -m` (job
+  // control) variant was built and tested specifically to also reach any
+  // children localsend-cli might spawn, and it reliably rendered and bound
+  // the port correctly when launched by hand — but launched the way this
+  // plugin actually launches it (spawned by the shell's own Process
+  // element, not an interactive terminal), it made the watchdog's own shell
+  // exit unexpectedly moments after backgrounding the job, silently
+  // orphaning localsend-cli instead of fixing anything — confirmed via
+  // repeated clean-slate reproductions, and a regression in the exact
+  // reliability this watchdog exists to provide. localsend-cli is a single
+  // Rust TUI process with no observed subprocess-spawning behavior in
+  // normal operation, so signaling its PID directly already covers the
+  // realistic case.
   readonly property string backgroundWatchdogScript:
     "PLUGIN_DIR=" + Util.shellQuote(installedPluginDir) + "\n" +
     "while [[ -d \"$PLUGIN_DIR\" ]]; do\n" +
     "  localsend-cli &\n" +
     "  pid=$!\n" +
     "  while kill -0 \"$pid\" 2>/dev/null; do\n" +
-    "    [[ -d \"$PLUGIN_DIR\" ]] || { kill \"$pid\" 2>/dev/null; break; }\n" +
+    "    [[ -d \"$PLUGIN_DIR\" ]] || break\n" +
     "    sleep 5\n" +
     "  done\n" +
+    "  if kill -0 \"$pid\" 2>/dev/null; then\n" +
+    "    kill -TERM \"$pid\" 2>/dev/null\n" +
+    "    for i in 1 2 3 4 5; do\n" +
+    "      kill -0 \"$pid\" 2>/dev/null || break\n" +
+    "      sleep 1\n" +
+    "    done\n" +
+    "    kill -0 \"$pid\" 2>/dev/null && kill -KILL \"$pid\" 2>/dev/null\n" +
+    "  fi\n" +
     "  wait \"$pid\" 2>/dev/null\n" +
     "  [[ -d \"$PLUGIN_DIR\" ]] || break\n" +
     "done\n"
@@ -142,7 +168,50 @@ BarWidget {
   // Read fresh by the script at restart time — not baked in at install time —
   // so toggling the setting mid-session (including while an interactive
   // session is open) takes effect the moment that session closes.
-  readonly property string backgroundEnabledFlagPath: helperDir + "/background-enabled"
+  readonly property string backgroundEnabledFlagName: "background-enabled"
+  readonly property string backgroundEnabledFlagPath: helperDir + "/" + backgroundEnabledFlagName
+
+  // A plain `$(cat "$FLAG")` has the same problems the file list read used
+  // to: `cat` follows a symlink at that predictable path, and reading a
+  // regular file with no size bound is fine, but if a same-uid process
+  // instead replaced the flag with a real FIFO node (not a symlink — a
+  // different attack O_NOFOLLOW alone doesn't cover) the plain open() call
+  // would block forever waiting for a writer that never comes. This reuses
+  // the same held-directory-fd pattern as the list reader (verified real
+  // 0700 directory owned by this user, leaf opened through that fd with
+  // O_NOFOLLOW) and adds O_NONBLOCK on the leaf open specifically so a FIFO
+  // can never block the open either — the immediate regular-file check
+  // after opening rejects a FIFO before any read is attempted, and
+  // O_NONBLOCK has no effect on a real regular file's read behavior, so
+  // there's no downside for the legitimate case. Bounded to 16 bytes: the
+  // only valid contents are "0" or "1".
+  readonly property string pythonFlagReaderScript:
+    "import sys, os, stat\n" +
+    "dir_path = sys.argv[1]\n" +
+    "name = sys.argv[2]\n" +
+    "max_len = 16\n" +
+    "try:\n" +
+    "    dir_fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n" +
+    "except OSError:\n" +
+    "    sys.exit(1)\n" +
+    "try:\n" +
+    "    dst = os.fstat(dir_fd)\n" +
+    "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or (dst.st_mode & 0o777) != 0o700:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)\n" +
+    "    except OSError:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        st = os.fstat(fd)\n" +
+    "        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > max_len:\n" +
+    "            sys.exit(1)\n" +
+    "        data = os.read(fd, max_len)\n" +
+    "    finally:\n" +
+    "        os.close(fd)\n" +
+    "    sys.stdout.buffer.write(data)\n" +
+    "finally:\n" +
+    "    os.close(dir_fd)\n"
 
   // Opens the dropped-file list with a genuine no-follow, inode-bound read
   // at every level, not just the leaf. A first attempt used
@@ -218,7 +287,7 @@ BarWidget {
   readonly property string helperScript:
     "#!/bin/bash\n" +
     "SESSION=" + Util.shellQuote(bgSession) + "\n" +
-    "FLAG=" + Util.shellQuote(backgroundEnabledFlagPath) + "\n" +
+    "FLAGNAME=" + Util.shellQuote(backgroundEnabledFlagName) + "\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     "ARGS=()\n" +
     // $1 is only ever a boolean "was a list dropped this time" signal here,
@@ -239,7 +308,21 @@ BarWidget {
     ")\n" +
     "fi\n" +
     "localsend-cli \"${ARGS[@]}\"\n" +
-    "if command -v tmux >/dev/null 2>&1 && [[ \"$(cat \"$FLAG\" 2>/dev/null)\" != \"0\" ]]; then\n" +
+    // A plain `FLAGVAL=$(cmd)` on a failing/refused read leaves FLAGVAL as
+    // an EMPTY string, not "0" — and "" != "0" is true in bash, which would
+    // make any rejected read (a symlinked or FIFO-replaced flag, or python3
+    // missing) look like an enabled flag and start the background receiver
+    // rather than failing closed. The explicit exit-status check below is
+    // what actually enforces "any failure here means treat it as disabled".
+    "FLAGVAL=0\n" +
+    "if command -v python3 >/dev/null 2>&1; then\n" +
+    "  FLAGVAL=$(python3 - \"$LISTDIR\" \"$FLAGNAME\" <<'PYEOF'\n" +
+    pythonFlagReaderScript +
+    "PYEOF\n" +
+    ")\n" +
+    "  [[ $? -eq 0 ]] || FLAGVAL=0\n" +
+    "fi\n" +
+    "if command -v tmux >/dev/null 2>&1 && [[ \"$FLAGVAL\" != \"0\" ]]; then\n" +
     "  tmux new-session -d -s \"$SESSION\" bash -c " + Util.shellQuote(backgroundWatchdogScript) + "\n" +
     "fi\n"
 
