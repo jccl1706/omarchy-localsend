@@ -46,18 +46,32 @@ BarWidget {
 
   // A real file rather than an inline `bash -c "a; b; c"` string: the launch
   // command passes through omarchy-launch-or-focus-tui's own argv handling,
-  // which flattens and re-parses it along the way — a semicolon-chained
-  // string loses its quoting there and only the first command survives. A
-  // plain script path plus simple `-f <path>` tokens has no such characters
-  // to lose, so it round-trips intact (same shape as the plain -f case).
+  // which flattens and re-parses it along the way, corrupting anything with
+  // shell metacharacters — a semicolon-chained string loses everything after
+  // the first `;`, and (worse) even a single quoted `-f <path>` argument
+  // gets its quotes stripped, so a path containing a space silently splits
+  // into two arguments. A plain script path has no such characters to lose.
+  //
+  // File paths to send go through the same launcher, so they can't be argv
+  // either: they're written to a list file instead (one path per line) and
+  // only that file's own space-free path crosses the launcher — the same
+  // file-based handoff Omarchy's own image picker uses for this reason.
   readonly property string helperDir: Quickshell.env("HOME") + "/.local/state/omarchy-localsend"
   readonly property string helperPath: helperDir + "/interactive.sh"
+  readonly property string fileListPath: helperDir + "/pending-files.list"
   readonly property string helperScript:
     "#!/bin/bash\n" +
     "SESSION=" + Util.shellQuote(bgSession) + "\n" +
-    "tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
-    "localsend-cli \"$@\"\n" +
-    "tmux new-session -d -s \"$SESSION\" localsend-cli\n"
+    "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
+    "ARGS=()\n" +
+    "if [[ -n \"$1\" && -f \"$1\" ]]; then\n" +
+    "  while IFS= read -r line; do\n" +
+    "    [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
+    "  done < \"$1\"\n" +
+    "  rm -f \"$1\"\n" +
+    "fi\n" +
+    "localsend-cli \"${ARGS[@]}\"\n" +
+    "command -v tmux >/dev/null 2>&1 && tmux new-session -d -s \"$SESSION\" localsend-cli\n"
 
   function installHelperScript() {
     installHelperProc.command = ["bash", "-c",
@@ -65,6 +79,18 @@ BarWidget {
       + " && printf '%s' " + Util.shellQuote(helperScript) + " > " + Util.shellQuote(helperPath)
       + " && chmod +x " + Util.shellQuote(helperPath)]
     installHelperProc.running = true
+  }
+
+  // Runs entirely through our own Process (a real exec array, no shell
+  // re-parsing), so paths with spaces or quotes are safe here even though
+  // they aren't once they'd cross omarchy-launch-or-focus-tui.
+  function writeFileList(filePaths, onWritten) {
+    var content = ""
+    for (var i = 0; i < filePaths.length; i++) content += filePaths[i] + "\n"
+    writeFileListProc.command = ["bash", "-c",
+      "printf '%s' " + Util.shellQuote(content) + " > " + Util.shellQuote(fileListPath)]
+    writeFileListProc.onWritten = onWritten
+    writeFileListProc.running = true
   }
 
   function ensureBackgroundReceiver() {
@@ -132,22 +158,19 @@ BarWidget {
 
   function openLocalSend(filePaths) {
     if (!bar) return
-    var fileArgs = ""
-    for (var i = 0; i < filePaths.length; i++) fileArgs += " -f " + Util.shellQuote(filePaths[i])
 
-    var command
-    if (tmuxAvailable) {
-      // The helper script frees the port from the background receiver, runs
-      // the interactive session in view, then brings the background
-      // receiver back once it exits.
-      command = Util.shellQuote(helperPath) + fileArgs
-      root.receiving = false
-    } else {
-      command = "localsend-cli" + fileArgs
+    function launch(extraArg) {
+      var command = Util.shellQuote(helperPath) + (extraArg ? " " + Util.shellQuote(extraArg) : "")
+      bar.run("omarchy-launch-or-focus-tui --app-id=" + appId + " " + command)
+      if (tmuxAvailable) root.receiving = false
+      root.close()
     }
 
-    bar.run("omarchy-launch-or-focus-tui --app-id=" + appId + " " + command)
-    root.close()
+    if (filePaths.length > 0) {
+      writeFileList(filePaths, function() { launch(fileListPath) })
+    } else {
+      launch("")
+    }
   }
 
   implicitWidth: button.implicitWidth
@@ -199,6 +222,12 @@ BarWidget {
 
   Process {
     id: installHelperProc
+  }
+
+  Process {
+    id: writeFileListProc
+    property var onWritten: null
+    onExited: if (onWritten) onWritten()
   }
 
   Process {

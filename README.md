@@ -40,8 +40,8 @@ need `omarchy restart shell` rather than relying on hot-reload.)
   `localsend-cli` TUI in a floating terminal (via `omarchy-launch-or-focus-tui`)
   to browse nearby devices and pair them. Closing that terminal automatically
   brings the background receiver back.
-- **Drop a file** onto the icon: same swap, pre-loaded with that file via
-  `localsend-cli -f <path>`; select a discovered device to send it.
+- **Drop one or more files** onto the icon: same swap, pre-loaded with those
+  files; select a discovered device to send them.
 - Click the icon again (or click outside) to open/close the popup, which
   shows the device alias, port, and download destination read from
   `~/.config/localsend-cli/config.toml`, plus the last few files received.
@@ -72,12 +72,17 @@ Or by hand: `omarchy plugin disable io.github.jccl1706.localsend`, then delete
 - `Widget.qml` — the bar icon, popup panel, and drag-and-drop handling
 - `LICENSE` — MIT
 
-When `tmux` is available, the widget writes a small helper script to
-`~/.local/state/omarchy-localsend/interactive.sh` on load. It exists because
-the launch command passes through `omarchy-launch-or-focus-tui`'s own argv
-handling, which flattens and re-parses it along the way — an inline
-semicolon-chained `bash -c "a; b; c"` string loses its quoting there. A
-plain script path with simple arguments doesn't.
+The widget writes a small helper script to
+`~/.local/state/omarchy-localsend/interactive.sh` on load, and (when sending)
+a `pending-files.list` alongside it. Both exist because the launch command
+passes through `omarchy-launch-or-focus-tui`'s own argv handling, which
+flattens and re-parses it along the way, corrupting anything with shell
+metacharacters: an inline semicolon-chained `bash -c "a; b; c"` string loses
+everything after the first `;`, and even a single quoted argument loses its
+quotes — a file path containing a space silently splits into two arguments.
+A plain script path plus a plain list-file path have no such characters to
+lose; the file paths themselves travel via the list file's contents instead
+of argv.
 
 The bar icon is resolved from the system's installed icon theme at runtime
 (`Quickshell.iconPath("localsend", true)`, the `localsend` package installs
