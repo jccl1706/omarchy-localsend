@@ -11,10 +11,10 @@ bar — send and receive files over the LAN without leaving your desktop.
 
 ## Features
 
-- **Always reachable** — a hidden `localsend-cli` instance runs in the
-  background as soon as the plugin loads, so this PC can receive files at
-  any time, popup open or not. Toggle it off if you'd rather only be
-  reachable while the widget is open.
+- **Always reachable (opt-in)** — turn on background receiving and a hidden
+  `localsend-cli` instance keeps this PC reachable at any time, popup open or
+  not. Off by default: the plugin never runs anything in the background
+  until you explicitly enable it.
 - **Drag and drop to send** — drop one or more files on the bar icon to pick
   a nearby device and send them.
 - **Click to pair** — click the icon to open the `localsend-cli` TUI in a
@@ -57,7 +57,8 @@ For local development, a symlink in place of `cp -r` works too, but
 
 | Action | Result |
 |---|---|
-| Idle | Background receiver keeps this PC reachable; popup status row shows "Receiving in background" |
+| Idle, background receiving on | Background receiver keeps this PC reachable; popup status row shows "Receiving in background" |
+| Idle, background receiving off (default) | Only reachable while the widget's terminal is open |
 | Click the bar icon | Opens the `localsend-cli` TUI in a floating terminal to browse and pair nearby devices |
 | Drop files on the bar icon | Opens the same TUI, pre-loaded with those files — pick a device to send |
 | Close the floating terminal | Background receiver comes back automatically |
@@ -68,11 +69,13 @@ it clears the next time you open the popup.
 
 ## Configuration
 
-- **Background receiving** — toggle in the popup (persisted to
-  `shell.json`). Also available over IPC:
+- **Background receiving** — off by default; toggle in the popup (persisted
+  to `shell.json`). Also available over IPC:
   ```bash
   omarchy-shell io.github.jccl1706.localsend toggleBackgroundReceiving
   ```
+  Disabling or removing the plugin kills the background listener and deletes
+  its generated helper files.
 - **Everything else** — reflects `localsend-cli`'s own config. Edit
   `~/.config/localsend-cli/config.toml` to change the alias, port, or
   download destination (see the comments in that file); the recent-files

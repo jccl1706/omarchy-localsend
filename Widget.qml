@@ -43,7 +43,11 @@ BarWidget {
   readonly property string bgSession: "omarchy-localsend-receiver"
   property bool tmuxAvailable: false
   property bool receiving: false
-  readonly property bool backgroundReceivingEnabled: setting("backgroundReceiving", true) === true
+  // Opt-in, not opt-out: silently starting a hidden background listener (and
+  // persisting an executable helper script) the first time this plugin loads
+  // would run code the user never asked for. Background receiving only turns
+  // on once the user explicitly enables it via the popup toggle or IPC.
+  readonly property bool backgroundReceivingEnabled: setting("backgroundReceiving", false) === true
 
   function setBackgroundReceivingEnabled(enabled) {
     var entry = { id: root.moduleName }
@@ -120,14 +124,30 @@ BarWidget {
     "FLAG=" + Util.shellQuote(backgroundEnabledFlagPath) + "\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     "ARGS=()\n" +
-    "if [[ -n \"$1\" && -f \"$1\" ]]; then\n" +
+    // The list file is deleted below on every path through this block, but
+    // it's re-validated on every read rather than trusted just because it
+    // sits at a path this script itself wrote: a regular, non-symlink file
+    // owned by this user, within a total-size bound consistent with at most
+    // maxDroppedFiles records of at most maxPathLength bytes each. Any
+    // record exceeding those per-record bounds aborts the whole batch
+    // (ARGS cleared) instead of silently truncating to the cap, since a
+    // file that big or that record-heavy is not one this script wrote.
+    "if [[ -n \"$1\" && -f \"$1\" && ! -L \"$1\" && -O \"$1\" ]]; then\n" +
+    "  size=$(stat -c%s -- \"$1\" 2>/dev/null || echo -1)\n" +
+    "  if (( size >= 0 && size <= " + (maxPathLength * maxDroppedFiles) + " )); then\n" +
+    "    count=0\n" +
+    "    ok=1\n" +
     // NUL-delimited, not newline-delimited: a Linux filename may legally
     // contain a newline, so reading line-by-line would let a crafted
     // filename inject an extra, attacker-chosen -f argument. NUL is the one
     // byte that can never appear in a filename, so it's unambiguous.
-    "  while IFS= read -r -d '' line; do\n" +
-    "    [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
-    "  done < \"$1\"\n" +
+    "    while IFS= read -r -d '' line; do\n" +
+    "      count=$((count + 1))\n" +
+    "      if (( count > " + maxDroppedFiles + " || ${#line} > " + maxPathLength + " )); then ok=0; break; fi\n" +
+    "      [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
+    "    done < \"$1\"\n" +
+    "    [[ \"$ok\" == 1 ]] || ARGS=()\n" +
+    "  fi\n" +
     "  rm -f \"$1\"\n" +
     "fi\n" +
     "localsend-cli \"${ARGS[@]}\"\n" +
@@ -235,22 +255,46 @@ BarWidget {
     tmuxCheckProc.running = true
   }
 
+  // Disabling or removing the plugin destroys this Item (the bar's Loader
+  // tears it down), so this is the one place that reliably runs on both
+  // paths. Uses Quickshell.execDetached rather than one of this widget's own
+  // Process elements, since those are being torn down alongside root right
+  // now and may not get a chance to actually run. Best-effort: this can't
+  // reach a case where the whole plugin directory is deleted without the
+  // shell ever unloading it first (e.g. removed while the shell isn't
+  // running), which is why the background receiver defaults to off.
+  Component.onDestruction: {
+    Quickshell.execDetached(["bash", "-c",
+      "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null\n"
+      + "rm -f -- " + Util.shellQuote(helperPath) + " " + Util.shellQuote(backgroundEnabledFlagPath) + " " + Util.shellQuote(fileListPath) + "\n"])
+  }
+
   readonly property int maxDroppedFiles: 64
   readonly property int maxPathLength: 4096
 
-  // Returns null for anything that isn't an actual local file: URL, or
-  // whose decoded path is empty/implausibly long — a drag source offering
-  // e.g. an http: or data: URL should never reach argv or a written file.
+  // Returns null for anything that isn't an actual local file: URL, or whose
+  // decoded path is empty/implausibly long — a drag source offering e.g. an
+  // http: or data: URL should never reach argv or a written file. A file:
+  // URL may carry a host/authority component (file://some-host/path) that
+  // means "fetch this from some-host", not a path on this machine, so that's
+  // rejected too rather than silently stripped. And since the result is
+  // treated as an absolute local path from here on, it's required to
+  // actually start with "/" post-decode and contain no ".." segment — a
+  // value like "file://../../etc/passwd" would otherwise decode to a
+  // relative path that escapes wherever it's later resolved from.
   function urlToPath(url) {
     var s = url.toString()
-    if (s.indexOf("file://") !== 0) return null
+    if (s.indexOf("file:///") !== 0) return null
     var decoded
     try {
       decoded = decodeURIComponent(s.substring(7))
     } catch (e) {
       return null
     }
-    if (decoded.length === 0 || decoded.length > maxPathLength) return null
+    if (decoded.length < 2 || decoded.length > maxPathLength) return null
+    if (decoded.charAt(0) !== "/") return null
+    var segments = decoded.split("/")
+    for (var i = 0; i < segments.length; i++) if (segments[i] === "..") return null
     return decoded
   }
 
