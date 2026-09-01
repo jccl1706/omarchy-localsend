@@ -142,56 +142,78 @@ BarWidget {
   // so toggling the setting mid-session (including while an interactive
   // session is open) takes effect the moment that session closes.
   readonly property string backgroundEnabledFlagPath: helperDir + "/background-enabled"
+
+  // Opens the dropped-file list with a genuine no-follow, inode-bound read:
+  // os.open(..., O_NOFOLLOW) refuses atomically if the final path component
+  // is a symlink (no separate check-then-open race is possible — the kernel
+  // enforces this as part of the single open() call), and every check after
+  // that — regular file, owned by this user, within the size bound — plus
+  // the read itself happens via os.fstat()/os.read() on that exact fd, never
+  // by re-resolving the path. A record count over the cap, a record over
+  // the length cap, or any other validation failure prints nothing and
+  // exits non-zero, which the caller treats as "no valid list" — the same
+  // fail-closed behavior as every other rejection path here.
+  readonly property string pythonListReaderScript:
+    "import sys, os, stat\n" +
+    "max_records = int(sys.argv[1])\n" +
+    "max_len = int(sys.argv[2])\n" +
+    "path = sys.argv[3]\n" +
+    "try:\n" +
+    "    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)\n" +
+    "except OSError:\n" +
+    "    sys.exit(1)\n" +
+    "try:\n" +
+    "    st = os.fstat(fd)\n" +
+    "    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():\n" +
+    "        sys.exit(1)\n" +
+    "    if st.st_size > max_records * max_len:\n" +
+    "        sys.exit(1)\n" +
+    "    data = os.read(fd, st.st_size + 1)\n" +
+    "    if len(data) != st.st_size:\n" +
+    "        sys.exit(1)\n" +
+    "finally:\n" +
+    "    os.close(fd)\n" +
+    "records = data.split(b'\\0')\n" +
+    "if records and records[-1] == b'':\n" +
+    "    records.pop()\n" +
+    "if len(records) > max_records:\n" +
+    "    sys.exit(1)\n" +
+    "for r in records:\n" +
+    "    if len(r) == 0 or len(r) > max_len:\n" +
+    "        sys.exit(1)\n" +
+    "out = b'\\0'.join(records)\n" +
+    "if records:\n" +
+    "    out += b'\\0'\n" +
+    "sys.stdout.buffer.write(out)\n"
+
   readonly property string helperScript:
     "#!/bin/bash\n" +
     "SESSION=" + Util.shellQuote(bgSession) + "\n" +
     "FLAG=" + Util.shellQuote(backgroundEnabledFlagPath) + "\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     "ARGS=()\n" +
-    // Checking a path and then separately opening/reading/deleting it is
-    // itself a race: whatever sits at that path can change between each of
-    // those pathname lookups. So this opens the path exactly once (fd 3) and
-    // does every check, the read, and nothing else, against that same
-    // already-open file description via /proc/self/fd/3 — which always
-    // refers to the file that got opened, never whatever the path currently
-    // resolves to. Only the final `rm -f` still names the path, but by then
-    // its content has already been fully read (or rejected) from the fd, so
-    // whatever it deletes can't change that outcome.
-    // No 2>/dev/null on this exec: since it has no command, any redirection
-    // after the failing one would apply to the shell's own stderr for the
-    // rest of the script the moment the open succeeds (verified directly —
-    // exec's own redirections are cumulative and permanent, not scoped to
-    // one command). A failed open here just prints one harmless diagnostic
-    // line and the surrounding `&&` lets the script continue past it.
-    "if [[ -n \"$1\" ]] && exec 3<\"$1\"; then\n" +
-    "  if [[ -f /proc/self/fd/3 && -O /proc/self/fd/3 ]]; then\n" +
-    "    size=$(stat -c%s -- /proc/self/fd/3 2>/dev/null || echo -1)\n" +
-    // The list file is deleted below on every path through this block, but
-    // its content is re-validated on every read rather than trusted just
-    // because it sits at a path this script itself wrote: a regular file
-    // owned by this user, within a total-size bound consistent with at most
-    // maxDroppedFiles records of at most maxPathLength bytes each. Any
-    // record exceeding those per-record bounds aborts the whole batch
-    // (ARGS cleared) instead of silently truncating to the cap, since a
-    // file that big or that record-heavy is not one this script wrote.
-    "    if (( size >= 0 && size <= " + (maxPathLength * maxDroppedFiles) + " )); then\n" +
-    "      count=0\n" +
-    "      ok=1\n" +
-    // NUL-delimited, not newline-delimited: a Linux filename may legally
-    // contain a newline, so reading line-by-line would let a crafted
-    // filename inject an extra, attacker-chosen -f argument. NUL is the one
-    // byte that can never appear in a filename, so it's unambiguous.
-    "      while IFS= read -r -d '' -u 3 line; do\n" +
-    "        count=$((count + 1))\n" +
-    "        if (( count > " + maxDroppedFiles + " || ${#line} > " + maxPathLength + " )); then ok=0; break; fi\n" +
-    "        [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
-    "      done\n" +
-    "      [[ \"$ok\" == 1 ]] || ARGS=()\n" +
-    "    fi\n" +
-    "  fi\n" +
-    "  exec 3<&-\n" +
-    "  rm -f -- \"$1\"\n" +
+    // bash's own `<` redirection always follows a symlink at the final path
+    // component — there is no O_NOFOLLOW available through a plain
+    // redirection, so a same-uid process could otherwise replace this
+    // predictable path with a symlink to any file this user owns and have
+    // it silently read as if it were the dropped-file list. python3's
+    // os.open(path, O_RDONLY | O_NOFOLLOW) refuses that atomically at the
+    // syscall level (a race-free kernel guarantee, not a check-then-open),
+    // and every subsequent check — regular file, owned by this user, size,
+    // and the read itself — happens against the fstat()'d and read() fd
+    // that call returned, never by re-resolving the path. Only the final
+    // `rm -f` below still names the path, but by then the content has
+    // already been fully read (or rejected) from that fd, so a swap at that
+    // point changes nothing about what was already validated.
+    "if [[ -n \"$1\" ]] && command -v python3 >/dev/null 2>&1; then\n" +
+    "  while IFS= read -r -d '' line; do\n" +
+    "    [[ -n \"$line\" ]] && ARGS+=(-f \"$line\")\n" +
+    "  done < <(python3 - " + maxDroppedFiles + " " + maxPathLength + " \"$1\" <<'PYEOF'\n" +
+    pythonListReaderScript +
+    "PYEOF\n" +
+    ")\n" +
     "fi\n" +
+    "[[ -n \"$1\" ]] && rm -f -- \"$1\"\n" +
     "localsend-cli \"${ARGS[@]}\"\n" +
     "if command -v tmux >/dev/null 2>&1 && [[ \"$(cat \"$FLAG\" 2>/dev/null)\" != \"0\" ]]; then\n" +
     "  tmux new-session -d -s \"$SESSION\" bash -c " + Util.shellQuote(backgroundWatchdogScript) + "\n" +

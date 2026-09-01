@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jccl1706.localsend",
   "name": "LocalSend",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "author": "jc",
   "license": "MIT",
   "description": "Send and receive files over the LAN via LocalSend, right from the Omarchy bar",
