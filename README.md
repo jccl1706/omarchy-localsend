@@ -7,6 +7,8 @@ A bar-widget plugin for the [Omarchy](https://omarchy.org) shell that brings
 [LocalSend](https://localsend.org) (via the `localsend-cli` package) into the
 bar — send and receive files over the LAN without leaving your desktop.
 
+<img src="preview.png" alt="LocalSend popup showing background-receiving status, port, destination, and recently received files" width="360">
+
 ## Features
 
 - **Always reachable** — a hidden `localsend-cli` instance runs in the
