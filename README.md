@@ -1,7 +1,7 @@
 # omarchy-localsend
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Omarchy plugin](https://img.shields.io/badge/omarchy-bar--widget-orange.svg)](https://github.com/basecamp/omarchy)
+[![Omarchy plugin](https://img.shields.io/badge/omarchy-bar--widget-orange.svg)](https://github.com/omacom/omarchy)
 
 A bar-widget plugin for the [Omarchy](https://omarchy.org) shell that brings
 [LocalSend](https://localsend.org) (via the `localsend-cli` package) into the
