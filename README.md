@@ -26,7 +26,13 @@ bar — send and receive files over the LAN without leaving your desktop.
   seen before; devices you've already paired with (by sending to them, or by
   accepting them once — with or without this on) are unaffected either way.
 - **Drag and drop to send** — drop one or more files on the bar icon to pick
-  a nearby device and send them.
+  a nearby device and send them. When tmux is available and dropping the
+  files leaves exactly one device listed (paired devices are always listed
+  before merely-discovered ones, so your usual device wins even if a second,
+  unrelated one is also on the network), it's sent immediately with no extra
+  keypress — confirmed directly that a bare Enter, with no arrow navigation,
+  sends to whichever device is listed first. More than one device listed, or
+  none yet, both leave the picker open for you to choose by hand.
 - **Click to pair** — click the icon to open the `localsend-cli` TUI in a
   floating terminal and browse/pair nearby devices.
 - **Arrival badge + notifications** — a dot appears on the icon and a desktop

@@ -55,6 +55,23 @@ BarWidget {
   // while browsing/sending, then swapped back on exit. tmux is optional: if
   // it's missing, this degrades to the old on-demand-only behavior.
   readonly property string bgSession: "omarchy-localsend-receiver"
+  // Session the interactive (foreground) localsend-cli runs in when tmux is
+  // available — separate from bgSession, and only ever one or the other is
+  // alive at a time (the background receiver is killed before this starts).
+  // Wrapping the visible, user-facing session in tmux too (rather than just
+  // the hidden background one) is what makes auto-send below possible: it
+  // lets the widget read the on-screen device list and confirm a send on
+  // the user's behalf, the same way tmux send-keys already drives the
+  // background receiver's auto-accept.
+  readonly property string interactiveSession: "omarchy-localsend-interactive"
+  // Guards against sending Enter more than once for the same drop — reset
+  // to false every time a new send-with-files launch starts, and set once
+  // autoSendIfUnambiguous acts (successfully or not, so a launch that never
+  // reaches exactly one device doesn't keep retrying past its own attempt
+  // budget below).
+  property bool autoSendHandled: false
+  property int autoSendAttempts: 0
+  readonly property int maxAutoSendAttempts: 10
   property bool tmuxAvailable: false
   property bool receiving: false
   // Component.onDestruction (below) kills the background session the moment
@@ -582,7 +599,17 @@ BarWidget {
     "PYEOF\n" +
     ")\n" +
     "fi\n" +
-    "localsend-cli \"${ARGS[@]}\"\n" +
+    // Wrapped in tmux (blocking — not -d — so this script only continues to
+    // the background-receiver restart below once the user actually closes
+    // the window) when tmux is available: this is what lets the widget read
+    // the on-screen device list and confirm a send automatically. Without
+    // tmux, this degrades to the plain direct invocation exactly as before.
+    "if command -v tmux >/dev/null 2>&1; then\n" +
+    "  tmux kill-session -t " + Util.shellQuote(interactiveSession) + " 2>/dev/null\n" +
+    "  tmux new-session -s " + Util.shellQuote(interactiveSession) + " -- localsend-cli \"${ARGS[@]}\"\n" +
+    "else\n" +
+    "  localsend-cli \"${ARGS[@]}\"\n" +
+    "fi\n" +
     // A plain `FLAGVAL=$(cmd)` on a failing/refused read leaves FLAGVAL as
     // an EMPTY string, not "0" — and "" != "0" is true in bash, which would
     // make any rejected read (a symlinked or FIFO-replaced flag, or python3
@@ -838,11 +865,41 @@ BarWidget {
     }
 
     if (filePaths.length > 0) {
-      writeFileList(filePaths, function() { launch(fileListPath) }, function() {
+      writeFileList(filePaths, function() {
+        launch(fileListPath)
+        // Only meaningful (and only wired up in the launched script) when
+        // tmux is available — see interactiveSession above.
+        if (tmuxAvailable) root.beginAutoSend()
+      }, function() {
         console.warn("io.github.jccl1706.localsend: failed to write the file list; not launching")
       })
     } else {
       launch("")
+    }
+  }
+
+  // Polls the interactive session's on-screen device list for up to
+  // maxAutoSendAttempts tries, and presses Enter the moment exactly one
+  // device is listed — confirmed directly that a bare Enter with no arrow
+  // navigation sends to whichever entry is listed first, and that paired
+  // devices are always listed before merely-discovered ones, so "exactly
+  // one entry" is unambiguous regardless of whether it's the paired
+  // device or a fresh discovery. More than one entry, or none yet, are
+  // both left alone — ambiguous or not-ready-yet both mean a human picks.
+  function beginAutoSend() {
+    autoSendHandled = false
+    autoSendAttempts = 0
+    autoSendTimer.restart()
+  }
+
+  function handleAutoSendCheck(text) {
+    if (root.autoSendHandled) return
+    var matches = String(text || "").match(/\[\d+\]\s+\S/g)
+    var count = matches ? matches.length : 0
+    if (count === 1) {
+      root.autoSendHandled = true
+      autoSendTimer.stop()
+      autoSendConfirmProc.running = true
     }
   }
 
@@ -1038,6 +1095,37 @@ BarWidget {
   Process {
     id: acceptPendingProc
     command: ["tmux", "send-keys", "-t", root.bgSession, "P"]
+  }
+
+  Process {
+    id: autoSendCheckProc
+    command: ["tmux", "capture-pane", "-t", root.interactiveSession, "-p"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.handleAutoSendCheck(text) }
+  }
+
+  Process {
+    id: autoSendConfirmProc
+    command: ["tmux", "send-keys", "-t", root.interactiveSession, "Enter"]
+  }
+
+  // 500ms x 10 attempts = 5s ceiling — comfortably past the CLI's own
+  // announce burst (100ms/500ms/2000ms delays), so a device that's going to
+  // show up on its own does so well within this window. Stops immediately
+  // once handleAutoSendCheck finds exactly one device; otherwise just stops
+  // silently after the budget, leaving the still-open picker for the user.
+  Timer {
+    id: autoSendTimer
+    interval: 500
+    repeat: true
+    running: false
+    onTriggered: {
+      root.autoSendAttempts++
+      if (root.autoSendHandled || root.autoSendAttempts > root.maxAutoSendAttempts) {
+        stop()
+        return
+      }
+      if (!autoSendCheckProc.running) autoSendCheckProc.running = true
+    }
   }
 
   // Safety net for when the background receiver dies outside our control
