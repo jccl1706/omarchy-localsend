@@ -18,7 +18,9 @@ BarWidget {
   // the code, but its trademark clause doesn't grant redistribution rights
   // over the mark itself.
   readonly property string iconSource: Quickshell.iconPath("localsend", true)
-  readonly property string configPath: Quickshell.env("HOME") + "/.config/localsend-cli/config.toml"
+  readonly property string configDirPath: Quickshell.env("HOME") + "/.config/localsend-cli"
+  readonly property string configFileName: "config.toml"
+  readonly property string configPath: configDirPath + "/" + configFileName
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -27,10 +29,11 @@ BarWidget {
   // .text()) has no ceiling of its own, so an oversized file — a mistake or
   // a same-uid process replacing it — could exhaust memory/CPU repeatedly
   // in this long-lived shell process just from the read and each regex
-  // match against it. configText is instead produced by `head -c`, which
-  // stops after maxConfigBytes regardless of the file's real size, so nothing
-  // downstream (parseToml's regex, or any future consumer) ever sees more
-  // than that ceiling to begin with.
+  // match against it. configText is instead produced by
+  // pythonConfigReaderScript (below), which stops after maxConfigBytes
+  // regardless of the file's real size, so nothing downstream (parseToml's
+  // regex, or any future consumer) ever sees more than that ceiling to
+  // begin with.
   readonly property int maxConfigBytes: 65536
   property string configText: ""
   readonly property string deviceAlias: parseToml(configText, "alias", hostnameFile.text().trim() || "This device")
@@ -216,6 +219,45 @@ BarWidget {
     "    try:\n" +
     "        st = os.fstat(fd)\n" +
     "        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > max_len:\n" +
+    "            sys.exit(1)\n" +
+    "        data = os.read(fd, max_len)\n" +
+    "    finally:\n" +
+    "        os.close(fd)\n" +
+    "    sys.stdout.buffer.write(data)\n" +
+    "finally:\n" +
+    "    os.close(dir_fd)\n"
+
+  // config.toml lives in localsend-cli's own config directory, not one this
+  // plugin creates — it's typically 0755, not the 0700 this plugin enforces
+  // on its own state directory, so the directory check here accepts normal
+  // owner-writable-only permissions instead of requiring exactly 0700, but
+  // still refuses anything group- or other-writable (nothing but this user
+  // should be able to plant files there). Otherwise the same descriptor-
+  // based approach as the other readers: O_NOFOLLOW | O_DIRECTORY on the
+  // directory, O_NOFOLLOW | O_NONBLOCK on the leaf (refuses a symlink
+  // outright and never blocks opening a FIFO planted in its place), regular-
+  // file and ownership checks via fstat() on that exact fd, and a read
+  // capped at max_len regardless of the file's real size.
+  readonly property string pythonConfigReaderScript:
+    "import sys, os, stat\n" +
+    "dir_path = sys.argv[1]\n" +
+    "name = sys.argv[2]\n" +
+    "max_len = int(sys.argv[3])\n" +
+    "try:\n" +
+    "    dir_fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n" +
+    "except OSError:\n" +
+    "    sys.exit(1)\n" +
+    "try:\n" +
+    "    dst = os.fstat(dir_fd)\n" +
+    "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or (dst.st_mode & 0o022) != 0:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)\n" +
+    "    except OSError:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        st = os.fstat(fd)\n" +
+    "        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():\n" +
     "            sys.exit(1)\n" +
     "        data = os.read(fd, max_len)\n" +
     "    finally:\n" +
@@ -513,8 +555,9 @@ BarWidget {
 
   // Used only to detect that config.toml changed — its own .text()/.data()
   // are never called, so this never loads the file's content into memory
-  // itself; readConfigBounded() (via `head -c`) is what actually produces
-  // configText, capped regardless of the real file size.
+  // itself; readConfigBounded() is what actually produces configText, via
+  // pythonConfigReaderScript's descriptor-based no-follow/nonblocking read,
+  // capped regardless of the real file size.
   FileView {
     id: configFile
     path: root.configPath
@@ -523,9 +566,18 @@ BarWidget {
     onFileChanged: root.readConfigBounded()
   }
 
+  // Without python3, configText simply never updates (stays at its default
+  // "" until python3 is available), which parseToml's own fallback
+  // arguments already handle the same way a missing/unreadable config does
+  // — no separate fail-closed branch needed here. The outer `timeout` is a
+  // wall-clock backstop against something unrelated to the FIFO case
+  // O_NONBLOCK already covers (e.g. a stalled network filesystem).
   Process {
     id: configReadProc
-    command: ["bash", "-c", "head -c " + root.maxConfigBytes + " -- " + Util.shellQuote(root.configPath) + " 2>/dev/null"]
+    command: ["bash", "-c",
+      "command -v python3 >/dev/null 2>&1 && timeout 3 python3 - " + Util.shellQuote(root.configDirPath) + " " + Util.shellQuote(root.configFileName) + " " + root.maxConfigBytes + " <<'PYEOF'\n" +
+      pythonConfigReaderScript +
+      "PYEOF"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.configText = text }
   }
 
