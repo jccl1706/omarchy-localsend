@@ -144,41 +144,173 @@ BarWidget {
   // either: they're written to a list file instead (one path per line) and
   // only that file's own space-free path crosses the launcher — the same
   // file-based handoff Omarchy's own image picker uses for this reason.
-  readonly property string helperDir: Quickshell.env("HOME") + "/.local/state/omarchy-localsend"
-  readonly property string helperPath: helperDir + "/interactive.sh"
+  readonly property string stateParentDir: Quickshell.env("HOME") + "/.local/state"
+  readonly property string helperDirName: "omarchy-localsend"
+  readonly property string helperDir: stateParentDir + "/" + helperDirName
+  readonly property string helperName: "interactive.sh"
+  readonly property string helperPath: helperDir + "/" + helperName
   readonly property string fileListName: "pending-files.list"
   readonly property string fileListPath: helperDir + "/" + fileListName
 
-  // Shared by every write below. safe_dir refuses to use helperDir if it
-  // already exists as a symlink or non-directory, and creates it private
-  // (0700) otherwise. safe_write never opens the target path directly —
-  // it writes to a fresh mktemp file in the same directory (so the rename
-  // is atomic, same filesystem) and refuses a pre-existing symlink or
-  // non-regular file at the target, then atomically renames into place.
-  // A predictable path under a private, verified directory plus an atomic
-  // rename closes the window a plain `> file` redirect leaves open: a
-  // symlink planted at that path ahead of time could otherwise redirect
-  // the write to truncate some unrelated file the user owns.
-  readonly property string safeWriteLib:
-    "safe_dir() {\n" +
-    "  local dir=\"$1\"\n" +
-    "  if [[ -e \"$dir\" || -L \"$dir\" ]]; then\n" +
-    "    if [[ -L \"$dir\" || ! -d \"$dir\" ]]; then echo \"refusing: $dir is not a plain directory\" >&2; return 1; fi\n" +
-    "  else\n" +
-    "    mkdir -m 700 -- \"$dir\" || return 1\n" +
-    "  fi\n" +
-    "  chmod 700 -- \"$dir\" 2>/dev/null\n" +
-    "}\n" +
-    "safe_write() {\n" +
-    "  local target=\"$1\" mode=\"$2\" dir tmp\n" +
-    "  dir=$(dirname -- \"$target\")\n" +
-    "  if [[ -L \"$target\" ]]; then echo \"refusing: $target is a symlink\" >&2; return 1; fi\n" +
-    "  if [[ -e \"$target\" && ! -f \"$target\" ]]; then echo \"refusing: $target is not a regular file\" >&2; return 1; fi\n" +
-    "  tmp=$(mktemp -- \"$dir/.tmp.XXXXXX\") || return 1\n" +
-    "  chmod \"$mode\" -- \"$tmp\"\n" +
-    "  cat > \"$tmp\" || { rm -f -- \"$tmp\"; return 1; }\n" +
-    "  mv -f -- \"$tmp\" \"$target\"\n" +
-    "}\n"
+  // A first version of this checked helperDir/the write target by pathname
+  // (via bash's -L/-e/-f) and then separately re-resolved the same path
+  // again for chmod, mktemp, and mv — each a fresh lookup a same-uid
+  // process could race between, exactly the class of gap the read side was
+  // already hardened against. These are the write-side equivalent: hold a
+  // directory fd for the entire operation and never re-resolve the
+  // directory or the target name from a string once it's open.
+  //
+  // pythonSafeDirScript creates/verifies helperDir through its *parent's*
+  // fd — opened once, checked (real directory, owned by this user, not
+  // group/other-writable), then mkdir(dir_fd=)'d if missing. It re-opens
+  // the child by name through that same parent fd with O_NOFOLLOW (so a
+  // symlink swapped in between mkdir and this open is refused, not
+  // followed), and chmods 0700 via fchmod() on that open fd directly —
+  // never a chmod on a path.
+  readonly property string pythonSafeDirScript:
+    "import sys, os, stat\n" +
+    "parent_path = sys.argv[1]\n" +
+    "name = sys.argv[2]\n" +
+    "try:\n" +
+    "    parent_fd = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n" +
+    "except OSError:\n" +
+    "    sys.exit(1)\n" +
+    "try:\n" +
+    "    pst = os.fstat(parent_fd)\n" +
+    "    if not stat.S_ISDIR(pst.st_mode) or pst.st_uid != os.getuid() or (pst.st_mode & 0o022) != 0:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        os.mkdir(name, 0o700, dir_fd=parent_fd)\n" +
+    "    except FileExistsError:\n" +
+    "        pass\n" +
+    "    except OSError:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)\n" +
+    "    except OSError:\n" +
+    "        sys.exit(1)\n" +
+    "    try:\n" +
+    "        st = os.fstat(fd)\n" +
+    "        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():\n" +
+    "            sys.exit(1)\n" +
+    "        os.fchmod(fd, 0o700)\n" +
+    "    finally:\n" +
+    "        os.close(fd)\n" +
+    "finally:\n" +
+    "    os.close(parent_fd)\n"
+
+  // Reads the content to write from stdin — writes it to a randomly-named
+  // temp file created directly under the held directory fd (O_CREAT |
+  // O_EXCL, so it can't collide with or follow anything already there),
+  // then publishes it with a dir_fd-relative rename (renameat) — one atomic
+  // syscall, not a separately-resolved mktemp/chmod/mv sequence. A rename
+  // always atomically replaces whatever currently sits at the destination
+  // name (even a symlink — by replacing the symlink itself, never
+  // following it), so there's no separate "is something already there"
+  // check needed the way the old mktemp+mv version needed one.
+  // Reads its own source from stdin (python3 -), so the content to publish
+  // can't also arrive on stdin — it's instead handed in on fd 3 (the
+  // caller duplicates the real stdin pipe onto fd 3 before the heredoc
+  // takes over fd 0; verified directly that redirections apply in the
+  // order written, so fd 3 still holds the original piped content once
+  // python actually runs).
+  readonly property string pythonSafeWriteScript:
+    "import sys, os, stat, secrets\n" +
+    "dir_path = sys.argv[1]\n" +
+    "name = sys.argv[2]\n" +
+    "mode = int(sys.argv[3], 8)\n" +
+    "try:\n" +
+    "    dir_fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n" +
+    "except OSError:\n" +
+    "    sys.exit(1)\n" +
+    "try:\n" +
+    "    dst = os.fstat(dir_fd)\n" +
+    "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or (dst.st_mode & 0o777) != 0o700:\n" +
+    "        sys.exit(1)\n" +
+    "    data = os.fdopen(3, 'rb').read()\n" +
+    "    tmp_name = \".\" + name + \".\" + secrets.token_hex(8) + \".tmp\"\n" +
+    "    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode, dir_fd=dir_fd)\n" +
+    "    try:\n" +
+    "        os.write(fd, data)\n" +
+    "    finally:\n" +
+    "        os.close(fd)\n" +
+    "    try:\n" +
+    "        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)\n" +
+    "    except OSError:\n" +
+    "        os.unlink(tmp_name, dir_fd=dir_fd)\n" +
+    "        sys.exit(1)\n" +
+    "finally:\n" +
+    "    os.close(dir_fd)\n"
+
+  // Cleanup counterpart for Component.onDestruction: verifies each named
+  // leaf through the held directory fd (regular file, owned by this user)
+  // and only unlinks it if a fresh lstat immediately before the unlink
+  // still matches the exact device+inode that was just verified — the same
+  // inode-bound pattern the pending-list reader already uses, so a
+  // same-uid swap of the name in between can't make this remove something
+  // other than the file it actually checked. Best-effort: any name that
+  // fails a check is just skipped, not treated as fatal, since this only
+  // ever needs to clean up files this plugin itself created.
+  readonly property string pythonSafeUnlinkScript:
+    "import sys, os, stat\n" +
+    "dir_path = sys.argv[1]\n" +
+    "names = sys.argv[2:]\n" +
+    "try:\n" +
+    "    dir_fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n" +
+    "except OSError:\n" +
+    "    sys.exit(0)\n" +
+    "try:\n" +
+    "    dst = os.fstat(dir_fd)\n" +
+    "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid():\n" +
+    "        sys.exit(0)\n" +
+    "    for name in names:\n" +
+    "        try:\n" +
+    "            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)\n" +
+    "        except OSError:\n" +
+    "            continue\n" +
+    "        try:\n" +
+    "            st = os.fstat(fd)\n" +
+    "        finally:\n" +
+    "            os.close(fd)\n" +
+    "        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():\n" +
+    "            continue\n" +
+    "        try:\n" +
+    "            cur = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)\n" +
+    "            if cur.st_dev == st.st_dev and cur.st_ino == st.st_ino:\n" +
+    "                os.unlink(name, dir_fd=dir_fd)\n" +
+    "        except OSError:\n" +
+    "            pass\n" +
+    "finally:\n" +
+    "    os.close(dir_fd)\n"
+
+  // Builds the bash command every writer below shares: ensure helperDir via
+  // pythonSafeDirScript, then pipe stdin through pythonSafeWriteScript to
+  // publish it as `leafName` with `mode`. python3's absence fails the whole
+  // command (bash's own `&&` short-circuits), which every caller already
+  // treats as a write failure the same way any other failure is handled.
+  // The content to publish is expected on this command's own stdin (the
+  // caller pipes it in — e.g. `printf ... | bash -c <this>`). `3<&0` on the
+  // second python3 invocation duplicates that inherited stdin onto fd 3
+  // before its own heredoc reassigns fd 0 to the write script's source —
+  // confirmed directly that redirections apply in the order written, so
+  // fd 3 still holds the original piped content once python actually
+  // reads it. The first invocation (directory setup) never touches stdin
+  // at all, so it doesn't disturb what's waiting there for the second one.
+  //
+  // `&&` can't follow a heredoc terminator on the same or next line (a bash
+  // syntax error — confirmed directly), so the two steps are separate
+  // statements with an explicit exit-code check between them rather than
+  // one chained pipeline.
+  function safeWriteCommand(leafName, mode) {
+    return "command -v python3 >/dev/null 2>&1 || exit 1\n"
+      + "python3 - " + Util.shellQuote(stateParentDir) + " " + Util.shellQuote(helperDirName) + " <<'PYEOF1'\n"
+      + pythonSafeDirScript
+      + "PYEOF1\n"
+      + "if [ $? -ne 0 ]; then exit 1; fi\n"
+      + "python3 - " + Util.shellQuote(helperDir) + " " + Util.shellQuote(leafName) + " " + mode + " 3<&0 <<'PYEOF2'\n"
+      + pythonSafeWriteScript
+      + "PYEOF2\n"
+  }
   // Read fresh by the script at restart time — not baked in at install time —
   // so toggling the setting mid-session (including while an interactive
   // session is open) takes effect the moment that session closes.
@@ -408,17 +540,13 @@ BarWidget {
 
   function installHelperScript() {
     installHelperProc.command = ["bash", "-c",
-      safeWriteLib
-      + "safe_dir " + Util.shellQuote(helperDir) + " || exit 1\n"
-      + "printf '%s' " + Util.shellQuote(helperScript) + " | safe_write " + Util.shellQuote(helperPath) + " 700\n"]
+      "printf '%s' " + Util.shellQuote(helperScript) + " | bash -c " + Util.shellQuote(safeWriteCommand(helperName, "700"))]
     installHelperProc.running = true
   }
 
   function writeBackgroundEnabledFlag() {
     writeFlagProc.command = ["bash", "-c",
-      safeWriteLib
-      + "safe_dir " + Util.shellQuote(helperDir) + " || exit 1\n"
-      + "printf '%s' " + Util.shellQuote(backgroundReceivingEnabled ? "1" : "0") + " | safe_write " + Util.shellQuote(backgroundEnabledFlagPath) + " 600\n"]
+      "printf '%s' " + Util.shellQuote(backgroundReceivingEnabled ? "1" : "0") + " | bash -c " + Util.shellQuote(safeWriteCommand(backgroundEnabledFlagName, "600"))]
     writeFlagProc.running = true
   }
 
@@ -439,9 +567,7 @@ BarWidget {
   // so it can't inject an extra path the way joining with "\n" could.
   function writeFileList(filePaths, onWritten, onFailed) {
     var command = ["bash", "-c",
-      safeWriteLib
-      + "safe_dir " + Util.shellQuote(helperDir) + " || exit 1\n"
-      + "printf '%s\\0' \"$@\" | safe_write " + Util.shellQuote(fileListPath) + " 600\n",
+      "printf '%s\\0' \"$@\" | bash -c " + Util.shellQuote(safeWriteCommand(fileListName, "600")),
       "omarchy-localsend"]
     for (var i = 0; i < filePaths.length; i++) command.push(filePaths[i])
     writeFileListProc.command = command
@@ -522,7 +648,11 @@ BarWidget {
   Component.onDestruction: {
     Quickshell.execDetached(["bash", "-c",
       "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null\n"
-      + "rm -f -- " + Util.shellQuote(helperPath) + " " + Util.shellQuote(backgroundEnabledFlagPath) + " " + Util.shellQuote(fileListPath) + "\n"])
+      + "command -v python3 >/dev/null 2>&1 && python3 - " + Util.shellQuote(helperDir) + " "
+      + Util.shellQuote(helperName) + " " + Util.shellQuote(backgroundEnabledFlagName) + " " + Util.shellQuote(fileListName)
+      + " <<'PYEOF'\n"
+      + pythonSafeUnlinkScript
+      + "PYEOF\n"])
   }
 
   readonly property int maxDroppedFiles: 64
