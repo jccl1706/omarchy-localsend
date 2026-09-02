@@ -242,17 +242,26 @@ BarWidget {
     "finally:\n" +
     "    os.close(dir_fd)\n"
 
-  // Cleanup counterpart for Component.onDestruction: verifies each named
-  // leaf through the held directory fd (regular file, owned by this user)
-  // and only unlinks it if a fresh lstat immediately before the unlink
-  // still matches the exact device+inode that was just verified — the same
-  // inode-bound pattern the pending-list reader already uses, so a
-  // same-uid swap of the name in between can't make this remove something
-  // other than the file it actually checked. Best-effort: any name that
-  // fails a check is just skipped, not treated as fatal, since this only
-  // ever needs to clean up files this plugin itself created.
+  // Cleanup counterpart for Component.onDestruction. An earlier version
+  // verified each named leaf (open, fstat) and then separately lstat'd the
+  // same name again immediately before unlinking it — still two operations
+  // on the same predictable name, with a race between them a same-uid
+  // process could win. This claims the name FIRST instead: a single
+  // dir_fd-relative rename to a randomly-generated, unpredictable name (no
+  // one else can target a name they can't guess) atomically takes whatever
+  // currently sits at the original name — symlink, FIFO, regular file,
+  // whatever it is — off its predictable path in one syscall, immune to
+  // further interference from then on. Only *after* that claim does it
+  // verify what was actually claimed (O_NONBLOCK so a FIFO can't block this
+  // detached cleanup indefinitely; regular file; owned by this user) and
+  // unlink it only if that checks out. A name that doesn't verify is left
+  // quarantined under its unguessable name rather than deleted — "restore/
+  // refuse without deleting" — which is safe either way since nothing else
+  // can reach it there. Best-effort throughout: a name that doesn't exist,
+  // or any other failure, is just skipped, since this only ever needs to
+  // clean up files this plugin itself created.
   readonly property string pythonSafeUnlinkScript:
-    "import sys, os, stat\n" +
+    "import sys, os, stat, secrets\n" +
     "dir_path = sys.argv[1]\n" +
     "names = sys.argv[2:]\n" +
     "try:\n" +
@@ -264,22 +273,21 @@ BarWidget {
     "    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid():\n" +
     "        sys.exit(0)\n" +
     "    for name in names:\n" +
+    "        quarantine = \".\" + name + \".\" + secrets.token_hex(8) + \".gone\"\n" +
     "        try:\n" +
-    "            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)\n" +
+    "            os.rename(name, quarantine, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)\n" +
+    "        except OSError:\n" +
+    "            continue\n" +
+    "        try:\n" +
+    "            fd = os.open(quarantine, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)\n" +
     "        except OSError:\n" +
     "            continue\n" +
     "        try:\n" +
     "            st = os.fstat(fd)\n" +
     "        finally:\n" +
     "            os.close(fd)\n" +
-    "        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():\n" +
-    "            continue\n" +
-    "        try:\n" +
-    "            cur = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)\n" +
-    "            if cur.st_dev == st.st_dev and cur.st_ino == st.st_ino:\n" +
-    "                os.unlink(name, dir_fd=dir_fd)\n" +
-    "        except OSError:\n" +
-    "            pass\n" +
+    "        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():\n" +
+    "            os.unlink(quarantine, dir_fd=dir_fd)\n" +
     "finally:\n" +
     "    os.close(dir_fd)\n"
 
