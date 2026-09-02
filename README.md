@@ -12,9 +12,19 @@ bar — send and receive files over the LAN without leaving your desktop.
 ## Features
 
 - **Always reachable (opt-in)** — turn on background receiving and a hidden
-  `localsend-cli` instance keeps this PC reachable at any time, popup open or
-  not. Off by default: the plugin never runs anything in the background
-  until you explicitly enable it.
+  `localsend-cli` instance keeps this PC reachable, popup open or not. Off by
+  default: the plugin never runs anything in the background until you
+  explicitly enable it.
+- **Auto-accept new devices (opt-in, separate toggle)** — `localsend-cli`
+  itself auto-accepts every future request once a device has been paired
+  once, but its very first request needs an explicit Y/N/P decision no one
+  is present to make while running unattended in the background — confirmed
+  directly: without this on, a first-time sender's request just sits at that
+  prompt indefinitely and their transfer times out, with a notification
+  explaining why rather than silence. Turning this on lets the background
+  receiver decide "P" (accept and pair) on its own for a device it's never
+  seen before; devices you've already paired with (by sending to them, or by
+  accepting them once — with or without this on) are unaffected either way.
 - **Drag and drop to send** — drop one or more files on the bar icon to pick
   a nearby device and send them.
 - **Click to pair** — click the icon to open the `localsend-cli` TUI in a

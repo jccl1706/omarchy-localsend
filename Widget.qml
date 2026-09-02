@@ -153,6 +153,34 @@ BarWidget {
     else disableBackgroundReceiver()
   }
 
+  // localsend-cli's own trust model already auto-accepts every future
+  // request from a device once it's been paired once (confirmed directly:
+  // its own log line after the first accept reads "Paired. Future requests
+  // are auto-accepted.") — so this setting only ever matters for a device's
+  // very first contact. Off by default for the same reason
+  // backgroundReceivingEnabled itself is: this widens what background
+  // receiving accepts without asking, from "anyone I've already trusted
+  // once" to "anyone at all", and that's a real trust decision the user
+  // should opt into, not one this plugin makes silently on their behalf.
+  // Without it, a first-time sender's sole outcome is the notification
+  // below and a transfer that quietly times out — confirmed directly: with
+  // this off, a fresh device's send left the receiver sitting at "Accept?
+  // Y/N/P" indefinitely and the sender's own progress bar stuck at 0 B.
+  readonly property bool autoAcceptUnknownSenders: setting("autoAcceptUnknownSenders", false) === true
+
+  function setAutoAcceptUnknownSenders(enabled) {
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.autoAcceptUnknownSenders = enabled
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function toggleAutoAcceptUnknownSenders() {
+    setAutoAcceptUnknownSenders(!autoAcceptUnknownSenders)
+  }
+
   // A real file rather than an inline `bash -c "a; b; c"` string: the launch
   // command passes through omarchy-launch-or-focus-tui's own argv handling,
   // which flattens and re-parses it along the way, corrupting anything with
@@ -649,9 +677,77 @@ BarWidget {
     if (!recentFilesProc.running) recentFilesProc.running = true
   }
 
+  // Confirmed directly (same finding as this plugin family's OmaPorts
+  // sibling, same notification daemon): this system's notify-send
+  // interprets a markup subset in the body text — a literal "<b>" renders
+  // as actual bold, an "<img>" tag is silently swallowed. A received
+  // file's name and a sender's alias are both fully attacker-controlled
+  // (whoever's sending you something names their own file and sets their
+  // own device alias), so both need escaping before ever reaching
+  // notify-send rather than trusting either to already be plain text.
+  function escapeNotifyMarkup(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  }
+
   function notifyReceived(filename) {
     if (!bar) return
-    bar.run("notify-send " + Util.shellQuote("LocalSend") + " " + Util.shellQuote("Received " + filename) + " -i localsend")
+    bar.run("notify-send " + Util.shellQuote("LocalSend") + " " + Util.shellQuote("Received " + escapeNotifyMarkup(filename)) + " -i localsend")
+  }
+
+  // localsend-cli's own Y/N/P prompt for a first-contact sender sits
+  // unattended forever in the background receiver's tmux pane otherwise —
+  // confirmed directly (see autoAcceptUnknownSenders above). pane text is
+  // read via a fresh 'tmux capture-pane -p' each poll: localsend-cli
+  // doesn't run inside a shell here (bgSession's window runs
+  // backgroundWatchdogScript directly), so bgSession itself is a fixed
+  // constant, never attacker-influenceable, and safe as a plain argv
+  // element with no shell involved.
+  //
+  // pendingPromptAlias tracks the alias already acted on for whichever
+  // prompt is currently showing, so a still-visible prompt isn't re-acted
+  // on (sending P again is harmless once already paired, but re-firing the
+  // "turn on auto-accept" notification every few seconds while the same
+  // request just sits there would be spammy) — cleared the moment the pane
+  // no longer shows a pending prompt at all, so a later request (even a
+  // retry from the same alias after this one times out) is caught fresh.
+  property string pendingPromptAlias: ""
+
+  function checkPendingPrompt() {
+    if (root.receiving && !pendingPromptProc.running) pendingPromptProc.running = true
+  }
+
+  function handlePendingPromptText(text) {
+    if (text.indexOf("Accept? Y/N/P") === -1) {
+      root.pendingPromptAlias = ""
+      return
+    }
+    // The alias appears on its own bare "R <alias>" line right before the
+    // prompt — distinct from the "R <alias>: <message>" lines localsend-cli
+    // prints once a request is actually resolved, which always carry a
+    // colon this pattern excludes.
+    var match = /^R ([^:\n]+)$/m.exec(text)
+    var alias = match ? match[1] : "Unknown device"
+    if (alias === root.pendingPromptAlias) return
+    root.pendingPromptAlias = alias
+    if (root.autoAcceptUnknownSenders) {
+      acceptPendingProc.running = true
+      root.notifyAutoAccepted(alias)
+    } else {
+      root.notifyPendingUnknownSender(alias)
+    }
+  }
+
+  function notifyAutoAccepted(alias) {
+    if (!bar) return
+    bar.run("notify-send " + Util.shellQuote("LocalSend")
+      + " " + Util.shellQuote("Accepting new device: " + escapeNotifyMarkup(alias)) + " -i localsend")
+  }
+
+  function notifyPendingUnknownSender(alias) {
+    if (!bar) return
+    bar.run("notify-send " + Util.shellQuote("LocalSend — action needed")
+      + " " + Util.shellQuote(escapeNotifyMarkup(alias) + " wants to send you a file for the first time — background receiving can't accept a new device automatically. Turn on \"Auto-accept new devices\" in the popup, or this request will time out.")
+      + " -u critical -i localsend")
   }
 
   onDestinationDirChanged: {
@@ -919,6 +1015,31 @@ BarWidget {
     }
   }
 
+  Process {
+    id: pendingPromptProc
+    // Piped through tail rather than a plain argv capture-pane: this
+    // session accumulates the full scroll history of every request it's
+    // ever handled, and the alias regex in handlePendingPromptText has no
+    // way to tell an old, already-resolved "R <alias>" line from the
+    // current one without this — confirmed directly, a second sender's
+    // request was silently never acted on because the unbounded capture
+    // still contained the first sender's identical-shaped line earlier in
+    // the scrollback, which a non-global regex match always finds first.
+    // 20 lines, not just enough for a single-file request: a multi-file
+    // transfer lists one line per file between the alias line and the
+    // prompt, and a too-narrow tail would push the alias line out of view
+    // while leaving the prompt line itself (what actually matters for
+    // detection) still visible — a request for many files would then still
+    // get accepted, just under "Unknown device" in the notification.
+    command: ["bash", "-c", "tmux capture-pane -t " + Util.shellQuote(root.bgSession) + " -p 2>/dev/null | tail -20"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.handlePendingPromptText(text) }
+  }
+
+  Process {
+    id: acceptPendingProc
+    command: ["tmux", "send-keys", "-t", root.bgSession, "P"]
+  }
+
   // Safety net for when the background receiver dies outside our control
   // (crash, forced-closed terminal skipping the restart chain in
   // openLocalSend, first boot). Cheap to poll — tmux has-session is instant.
@@ -928,6 +1049,19 @@ BarWidget {
     repeat: true
     triggeredOnStart: true
     onTriggered: root.ensureBackgroundReceiver()
+  }
+
+  // A first-contact sender's request needs a response within whatever
+  // window their own client waits before giving up — 20s (the safety-net
+  // interval above) is too slow for that. tmux capture-pane is as cheap as
+  // has-session, so this polls independently and more often, but only
+  // while actually receiving in the background at all.
+  Timer {
+    interval: 3000
+    running: root.receiving
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.checkPendingPrompt()
   }
 
   IpcHandler {
@@ -940,6 +1074,7 @@ BarWidget {
     function toggle(): void { root.toggle() }
     function send(): void { root.openLocalSend([]) }
     function toggleBackgroundReceiving(): void { root.toggleBackgroundReceiving() }
+    function toggleAutoAcceptUnknownSenders(): void { root.toggleAutoAcceptUnknownSenders() }
   }
 
   BarIconButton {
@@ -1053,6 +1188,46 @@ BarWidget {
           foreground: root.foreground
           onToggled: root.toggleBackgroundReceiving()
         }
+      }
+
+      Item {
+        width: parent.width
+        visible: root.tmuxAvailable && root.backgroundReceivingEnabled
+        implicitHeight: Math.max(autoAcceptLabel.implicitHeight, autoAcceptToggle.implicitHeight)
+
+        Text {
+          id: autoAcceptLabel
+          anchors.left: parent.left
+          anchors.right: autoAcceptToggle.left
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          wrapMode: Text.WordWrap
+          text: "Auto-accept new devices"
+          opacity: 0.8
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        ToggleSwitch {
+          id: autoAcceptToggle
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          checked: root.autoAcceptUnknownSenders
+          foreground: root.foreground
+          onToggled: root.toggleAutoAcceptUnknownSenders()
+        }
+      }
+
+      Text {
+        width: parent.width
+        visible: root.tmuxAvailable && root.backgroundReceivingEnabled && !root.autoAcceptUnknownSenders
+        wrapMode: Text.WordWrap
+        text: "Off: a device you've never paired with can't be accepted while this popup is closed — its request will time out. Devices you've already sent to or received from are unaffected."
+        opacity: 0.6
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       Text {
