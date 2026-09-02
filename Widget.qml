@@ -341,7 +341,34 @@ BarWidget {
     "#!/bin/bash\n" +
     "SESSION=" + Util.shellQuote(bgSession) + "\n" +
     "FLAGNAME=" + Util.shellQuote(backgroundEnabledFlagName) + "\n" +
+    "PORT=" + Util.shellQuote(port) + "\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
+    // Killing the background session doesn't guarantee the old
+    // localsend-cli has actually released the port by the time this
+    // returns — verified directly: the process can still be bound to it a
+    // full 20+ seconds after `tmux kill-session` reports success.
+    // localsend-cli has no daemon/reload mode and doesn't set
+    // SO_REUSEADDR, so launching immediately can silently fail with
+    // "Address already in use" and exit — which is exactly what made a
+    // drag-and-drop send look like it did nothing: the terminal opened and
+    // closed on its own before there was any chance to read the error.
+    // This polls with a real TCP connect attempt (bash's /dev/tcp) rather
+    // than assuming any fixed delay is enough. Each attempt is itself
+    // wrapped in `timeout 0.2` — verified directly that a single connect
+    // attempt against a socket that's bound but not actively accepting can
+    // block far longer than expected (tens of seconds, not milliseconds),
+    // which would otherwise let one bad attempt blow through the intended
+    // overall bound entirely. A timed-out attempt (exit 124) is treated the
+    // same as "still occupied" rather than assumed free, since it proved
+    // nothing either way; only an actual connection refusal (nothing
+    // listening) breaks the loop early. Gives up after ~4.5s worst case so
+    // a genuinely stuck old process doesn't block the launch forever.
+    "for i in $(seq 1 15); do\n" +
+    "  timeout 0.2 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$PORT\" 2>/dev/null\n" +
+    "  rc=$?\n" +
+    "  if (( rc != 0 && rc != 124 )); then break; fi\n" +
+    "  sleep 0.1\n" +
+    "done\n" +
     "ARGS=()\n" +
     // $1 is only ever a boolean "was a list dropped this time" signal here,
     // not a path to trust and re-resolve — the actual open below always
