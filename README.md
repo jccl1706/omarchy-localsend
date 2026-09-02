@@ -32,6 +32,7 @@ bar — send and receive files over the LAN without leaving your desktop.
 | `bash` | The interactive-launch helper script and every background process it manages |
 | `python3` | Opens the dropped-file list with a race-free, no-follow read (`os.open(..., O_NOFOLLOW)`) — bash's own redirections have no equivalent, so without `python3` a dropped-file transfer silently sends with no files attached rather than falling back to a weaker read |
 | `tmux` (recommended) | Keeps this PC reachable in the background. Without it, `localsend-cli` only listens while the widget's terminal is open — it has no daemon mode of its own |
+| `systemd` user session (`systemctl --user`, `systemd-run`) | The background receiver runs in its own systemd user scope so it can be terminated completely — including any child processes — rather than by PID alone. Standard on Arch/Omarchy; not a separate package to install |
 
 ## Install
 

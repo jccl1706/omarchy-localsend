@@ -69,40 +69,61 @@ BarWidget {
   // alive normally, then exited (process and tmux session both gone) within
   // 2s of that directory being removed out from under it.
   readonly property string installedPluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/" + moduleName
-  // Termination is bounded rather than an unbounded `wait`: once the plugin
-  // directory is gone, send TERM, give it up to 5s to exit on its own, then
-  // KILL if it hasn't — verified directly against a process that traps and
-  // ignores TERM, confirming the KILL escalation actually fires.
+  // Reaching localsend-cli's whole process tree (not just its own PID) needs
+  // a boundary the kernel actually enforces as a unit. Two bash-level
+  // mechanisms for that were tried and ruled out first: job control
+  // (`set -m`) and a raw os.setpgid(0, 0) via Python both put the child in
+  // its own process group correctly and worked fine launched by hand, but
+  // launched the way this plugin actually launches it — spawned by the
+  // shell's own Process element and detached into `tmux new-session -d`,
+  // not an interactive terminal — both made the watchdog's own shell exit
+  // unexpectedly (moments after backgrounding under job control; within 1-2s
+  // even with no removal ever triggered under raw setpgid), silently
+  // orphaning localsend-cli instead of fixing anything. Confirmed via
+  // repeated clean-slate reproductions of each.
   //
-  // This signals the single PID, not a process group: a `set -m` (job
-  // control) variant was built and tested specifically to also reach any
-  // children localsend-cli might spawn, and it reliably rendered and bound
-  // the port correctly when launched by hand — but launched the way this
-  // plugin actually launches it (spawned by the shell's own Process
-  // element, not an interactive terminal), it made the watchdog's own shell
-  // exit unexpectedly moments after backgrounding the job, silently
-  // orphaning localsend-cli instead of fixing anything — confirmed via
-  // repeated clean-slate reproductions, and a regression in the exact
-  // reliability this watchdog exists to provide. localsend-cli is a single
-  // Rust TUI process with no observed subprocess-spawning behavior in
-  // normal operation, so signaling its PID directly already covers the
-  // realistic case.
+  // A systemd user scope sidesteps that class of problem entirely: it's a
+  // cgroup, not a process group, created via a D-Bus call rather than any
+  // process-group manipulation on the watchdog's own shell, so it doesn't
+  // touch whatever was making job control and setpgid unstable in this
+  // launch path. Verified directly, repeatedly: the scope preserves pty
+  // access (localsend-cli renders and binds the port normally running under
+  // it), `systemctl --user kill --kill-who=all` reaches every process in
+  // the cgroup — confirmed against a process that spawns a child of its own,
+  // both parent and child gone after one call — and the watchdog's own
+  // shell was unaffected across 5 repeated clean-slate runs, unlike either
+  // process-group attempt.
+  readonly property string bgUnit: "omarchy-localsend-receiver"
   readonly property string backgroundWatchdogScript:
     "PLUGIN_DIR=" + Util.shellQuote(installedPluginDir) + "\n" +
+    "UNIT=" + Util.shellQuote(bgUnit) + "\n" +
+    "PORT=" + Util.shellQuote(port) + "\n" +
     "while [[ -d \"$PLUGIN_DIR\" ]]; do\n" +
-    "  localsend-cli &\n" +
+    // Same bounded port-release wait as the interactive launch: a relaunch
+    // immediately after this loop's own previous iteration killed the old
+    // instance isn't guaranteed the port is free yet either, for the same
+    // reason (no SO_REUSEADDR, no daemon/reload mode). Without this, a
+    // same-cycle relaunch can fail fast on "Address already in use" and
+    // the outer loop would otherwise spin retrying with no backoff at all.
+    "  for i in $(seq 1 15); do\n" +
+    "    timeout 0.2 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$PORT\" 2>/dev/null\n" +
+    "    rc=$?\n" +
+    "    if (( rc != 0 && rc != 124 )); then break; fi\n" +
+    "    sleep 0.1\n" +
+    "  done\n" +
+    "  systemd-run --user --scope --collect --unit=\"$UNIT\" -- localsend-cli &\n" +
     "  pid=$!\n" +
     "  while kill -0 \"$pid\" 2>/dev/null; do\n" +
     "    [[ -d \"$PLUGIN_DIR\" ]] || break\n" +
     "    sleep 5\n" +
     "  done\n" +
     "  if kill -0 \"$pid\" 2>/dev/null; then\n" +
-    "    kill -TERM \"$pid\" 2>/dev/null\n" +
+    "    systemctl --user kill --kill-who=all --signal=SIGTERM \"$UNIT.scope\" 2>/dev/null\n" +
     "    for i in 1 2 3 4 5; do\n" +
     "      kill -0 \"$pid\" 2>/dev/null || break\n" +
     "      sleep 1\n" +
     "    done\n" +
-    "    kill -0 \"$pid\" 2>/dev/null && kill -KILL \"$pid\" 2>/dev/null\n" +
+    "    kill -0 \"$pid\" 2>/dev/null && systemctl --user kill --kill-who=all --signal=SIGKILL \"$UNIT.scope\" 2>/dev/null\n" +
     "  fi\n" +
     "  wait \"$pid\" 2>/dev/null\n" +
     "  [[ -d \"$PLUGIN_DIR\" ]] || break\n" +
@@ -480,8 +501,14 @@ BarWidget {
   readonly property string helperScript:
     "#!/bin/bash\n" +
     "SESSION=" + Util.shellQuote(bgSession) + "\n" +
+    "UNIT=" + Util.shellQuote(bgUnit) + "\n" +
     "FLAGNAME=" + Util.shellQuote(backgroundEnabledFlagName) + "\n" +
     "PORT=" + Util.shellQuote(port) + "\n" +
+    // The background receiver runs in its own systemd scope now, not
+    // directly in the tmux session's own process tree, so both need
+    // stopping here — tmux for the watchdog script itself, systemctl for
+    // the actual receiver process it launched into that scope.
+    "command -v systemctl >/dev/null 2>&1 && systemctl --user kill --kill-who=all --signal=SIGKILL \"$UNIT.scope\" 2>/dev/null\n" +
     "command -v tmux >/dev/null 2>&1 && tmux kill-session -t \"$SESSION\" 2>/dev/null\n" +
     // Killing the background session doesn't guarantee the old
     // localsend-cli has actually released the port by the time this
@@ -560,7 +587,8 @@ BarWidget {
 
   function disableBackgroundReceiver() {
     disableBgProc.command = ["bash", "-c",
-      "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null"]
+      "command -v systemctl >/dev/null 2>&1 && systemctl --user kill --kill-who=all --signal=SIGKILL " + Util.shellQuote(bgUnit + ".scope") + " 2>/dev/null\n"
+      + "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null"]
     disableBgProc.running = true
     root.receiving = false
   }
@@ -655,7 +683,14 @@ BarWidget {
   // running), which is why the background receiver defaults to off.
   Component.onDestruction: {
     Quickshell.execDetached(["bash", "-c",
-      "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null\n"
+      // The background receiver now runs in its own systemd user scope
+      // (see backgroundWatchdogScript), not tied to the tmux session's own
+      // process tree — killing the tmux session alone no longer reaches it,
+      // the same way it stopped reaching a process-group-separated child.
+      // The scope's unit name is fixed and predictable (bgUnit), so this
+      // can target it directly with no pidfile needed.
+      "command -v systemctl >/dev/null 2>&1 && systemctl --user kill --kill-who=all --signal=SIGKILL " + Util.shellQuote(bgUnit + ".scope") + " 2>/dev/null\n"
+      + "command -v tmux >/dev/null 2>&1 && tmux kill-session -t " + Util.shellQuote(bgSession) + " 2>/dev/null\n"
       + "command -v python3 >/dev/null 2>&1 && python3 - " + Util.shellQuote(helperDir) + " "
       + Util.shellQuote(helperName) + " " + Util.shellQuote(backgroundEnabledFlagName) + " " + Util.shellQuote(fileListName)
       + " <<'PYEOF'\n"
