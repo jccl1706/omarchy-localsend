@@ -20,8 +20,11 @@ bar — send and receive files over the LAN without leaving your desktop.
 - **Click to pair** — click the icon to open the `localsend-cli` TUI in a
   floating terminal and browse/pair nearby devices.
 - **Arrival badge + notifications** — a dot appears on the icon and a desktop
-  notification fires when a file arrives; the popup lists the last few files
-  received.
+  notification fires when the background receiver is confirmed active and a
+  file arrives; the popup always lists the last few files in the destination
+  folder regardless (it can't tell whether a given one arrived via LocalSend
+  or was just copied there another way — only the badge/notification claim
+  that specifically, and only while actively receiving).
 
 ## Requirements
 

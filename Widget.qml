@@ -816,8 +816,28 @@ BarWidget {
     stdout: SplitParser {
       onRead: function(filename) {
         root.refreshRecentFiles()
-        if (!root.opened) root.hasNewFile = true
-        root.notifyReceived(filename)
+        // inotify can only see that a file landed in the destination
+        // folder, never why — a plain `cp` or a drag-and-drop from a file
+        // manager into the same folder (commonly ~/Downloads, which
+        // plenty of other things also save into) fires the exact same
+        // event as an actual LocalSend transfer. Claiming "Received
+        // <file>" and lighting up the bar icon regardless was reported as
+        // misleading, and reproduced directly: copying a file into
+        // Downloads with the background receiver confirmed off (nothing
+        // bound to the port) still fired the notification. Gating both on
+        // `receiving` limits them to the one case this plugin can actually
+        // stand behind: the background receiver was confirmed running at
+        // that moment. A file arriving during an active *interactive*
+        // session isn't covered by this (receiving reads false then, by
+        // design, since it tracks the background listener specifically) —
+        // an acceptable gap since that transfer is already visible in the
+        // TUI the user has open at the time. The recent-files list itself
+        // stays unconditional either way: it only ever claims "recently
+        // modified in this folder", not "received via LocalSend".
+        if (root.receiving) {
+          if (!root.opened) root.hasNewFile = true
+          root.notifyReceived(filename)
+        }
       }
     }
     // Exponential backoff (5s, 10s, 20s, ... capped at 5 minutes) instead of
